@@ -18,7 +18,7 @@
 // #define NEO_ACTION_DECREASE_MINOR 990
 #define NEO_PARAM_NUM 1
 
-#define NEO_IGNORE_PACKETS 1
+#define NEO_IGNORE_PACKETS 5
 
 #define NEO_INTERVALS 20
 #define MONITOR_INTERVAL 30000
@@ -29,6 +29,7 @@ extern struct timespec64 tzero;
 static int id = 0;
 struct neo_interval {
 	u64 rate; /* sending rate of this interval, bytes/sec */
+	u64 cwnd;
 
 	u64 recv_start; /* timestamps for when interval was waiting for acks */
 	u64 recv_end;
@@ -60,9 +61,13 @@ struct neo_data {
 	int send_index; /* index of interval currently being sent */
 	int receive_index; /* index of interval currently receiving acks */
 
-	u64 rate; /* current sending rate */
-	u64 ready_rate; /* rate updated by RL model, used in the next MI */
+	// u64 rate; /* current sending rate */
+	// u64 ready_rate; /* rate updated by RL model, used in the next MI */
 	// u64 last_used_cwnd; /* last used rate to inform the agent */
+
+	u64 cwnd;
+	u64 ready_cwnd;
+
 
 	u32 lost_base; /* previously lost packets */
 	u32 delivered_base; /* previously delivered packets */
@@ -118,17 +123,13 @@ static u32 neo_get_rtt(struct tcp_sock *tp)
 	}
 }
 
-/**
- * With the ready_cwnd given by the RL agent. Calculate the real cwnd so that the average CWND/rate of all the unreceived MIs is the ready_cwnd.
- * rate1+rate2+rate3+new_rate = ready_cwnd * n
- * Used after send_index++ (new interval created.)
- * */
 
-void neo_calculate_and_set_rate(struct sock *sk, struct neo_data *neo,
+
+void neo_calculate_and_set_cwnd(struct sock *sk, struct neo_data *neo,
 				struct neo_interval *interval)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
-	u64 new_rate;
+	u64 new_cwnd;
 	u64 cwnd_sum = 0;
 	int recv_idx = neo->receive_index;
 	int send_idx = neo->send_index;
@@ -142,16 +143,52 @@ void neo_calculate_and_set_rate(struct sock *sk, struct neo_data *neo,
 	// 		num++;
 	// 	} while (idx != send_idx);
 	// }
-	new_rate = neo->ready_rate; // * (num + 1) - rate_sum;
-	new_rate = max(new_rate, NEO_RATE_MIN);
-	new_rate = min(new_rate, sk->sk_max_pacing_rate);
-	interval->rate = new_rate;
-	neo->rate = new_rate;
-	neo->ready_rate = new_rate; // in case no action is given. reuse the previous cwnd.
-	sk->sk_pacing_rate = new_rate;
+	new_cwnd = neo->ready_cwnd; // * (num + 1) - rate_sum;
+	new_cwnd = max(4ULL, new_cwnd);
+	new_cwnd = min((u32)new_cwnd, tp->snd_cwnd_clamp); /* apply cap */
+	interval->cwnd = new_cwnd;
+	neo->cwnd = new_cwnd;
+	neo->ready_cwnd = new_cwnd; // in case no action is given. reuse the previous cwnd.
+	tp->snd_cwnd = new_cwnd;
 	// pr_info("The ready rate is %llu, and the new rate is thus %llu, the ratio is %d", neo->ready_cwnd, new_rate, new_rate/neo->ready_cwnd);
 	
 }
+
+/**
+ * With the ready_cwnd given by the RL agent. Calculate the real cwnd so that the average CWND/rate of all the unreceived MIs is the ready_cwnd.
+ * rate1+rate2+rate3+new_rate = ready_cwnd * n
+ * Used after send_index++ (new interval created.)
+ * */
+
+// void neo_calculate_and_set_rate(struct sock *sk, struct neo_data *neo,
+// 				struct neo_interval *interval)
+// {
+// 	struct tcp_sock *tp = tcp_sk(sk);
+// 	u64 new_rate;
+// 	u64 cwnd_sum = 0;
+// 	int recv_idx = neo->receive_index;
+// 	int send_idx = neo->send_index;
+// 	int idx = recv_idx;
+// 	int num = 0;
+// 	// if (recv_idx != send_idx){
+// 	// 	do {
+// 	// 		rate_sum += neo->intervals[idx].rate;
+// 	// 		idx = get_next_index(idx);
+// 	// 		pr_info("add idx %d-th rate %llu, current rate sum: %llu, num: %d", idx, neo->intervals[idx].rate, rate_sum, num);
+// 	// 		num++;
+// 	// 	} while (idx != send_idx);
+// 	// }
+// 	new_rate = neo->ready_rate; // * (num + 1) - rate_sum;
+// 	new_rate = max(new_rate, NEO_RATE_MIN);
+// 	new_rate = min(new_rate, sk->sk_max_pacing_rate);
+// 	interval->rate = new_rate;
+// 	neo->rate = new_rate;
+// 	neo->ready_rate = new_rate; // in case no action is given. reuse the previous cwnd.
+// 	sk->sk_pacing_rate = new_rate;
+// 	// pr_info("The ready rate is %llu, and the new rate is thus %llu, the ratio is %d", neo->ready_cwnd, new_rate, new_rate/neo->ready_cwnd);
+	
+// }
+
 
 
 static void neo_update_pacing_rate(struct sock *sk)
@@ -167,8 +204,6 @@ static void neo_update_pacing_rate(struct sock *sk)
 	rate *= USEC_PER_SEC;
 
 	rate *= max(tp->snd_cwnd, tp->packets_out);
-
-	rate = rate >> 1;
 
 	if (likely(tp->srtt_us >> 3))
 		do_div(rate, tp->srtt_us >> 3);
@@ -214,8 +249,10 @@ void start_interval(struct sock *sk, struct neo_data *neo)
 	interval->packets_sent_base = max(tcp_sk(sk)->data_segs_out, 1U);
 	interval->send_start = tcp_sk(sk)->tcp_mstamp;
 	// pr_info("Start a interval, packets_sent_base: %d, send_start:%llu\n", interval->packets_sent_base, interval->send_start);
-	neo_calculate_and_set_rate(sk, neo, interval);
-	neo_set_cwnd(sk);
+	// neo_calculate_and_set_rate(sk, neo, interval);
+	// neo_set_cwnd(sk);
+	neo_calculate_and_set_cwnd(sk, neo, interval);
+	neo_update_pacing_rate(sk);
 }
 
 /**************************
@@ -281,7 +318,7 @@ void neo_process(struct sock *sk)
 
 	if (!neo_valid(neo))
 		return;
-	// neo_update_pacing_rate(sk);
+	neo_update_pacing_rate(sk);
 	/* update send intervals */
 	interval = &neo->intervals[neo->send_index];
 	if (send_interval_ended(interval, tsk, neo)) {
@@ -365,8 +402,8 @@ void neo_fetch_measurements(struct spine_connection *conn,
 	measurements[1] = neo->intervals[last_last_received_id].delivered;
 	measurements[2] = neo->intervals[last_received_id].lost;
 	measurements[3] = neo->intervals[last_last_received_id].lost;
-	measurements[4] = neo->intervals[last_received_id].rate;
-	measurements[5] = neo->intervals[last_last_received_id].rate;
+	measurements[4] = neo->intervals[last_received_id].cwnd;
+	measurements[5] = neo->intervals[last_last_received_id].cwnd;
 	measurements[6] = neo->intervals[last_received_id].end_rtt;
 	measurements[7]	= neo->intervals[last_received_id].start_rtt;
 	measurements[8] = neo->intervals[last_received_id].recv_end -
@@ -397,15 +434,15 @@ void neo_set_params(struct spine_connection *conn, u64 *params, u8 num_fields)
 		return;
 	}
 	if (params[0] == 1){
-		ca->ready_rate = ca->rate * NEO_ACTION_INCREASE / NEO_SCALE + 1;
+		ca->ready_cwnd = ca->cwnd * NEO_ACTION_INCREASE / NEO_SCALE + 1;
 	}else if (params[0] == 2){
-		ca->ready_rate = ca->rate * NEO_ACTION_DECREASE / NEO_SCALE - 1;
+		ca->ready_cwnd = ca->cwnd * NEO_ACTION_DECREASE / NEO_SCALE - 1;
 	// }else if (params[0] == 3){
 	// 	ca->ready_rate = ca->rate * NEO_ACTION_INCREASE_MINOR / NEO_SCALE + 1;
 	// }else if (params[0] == 4){
 	// 	ca->ready_rate = ca->rate * NEO_ACTION_DECREASE_MINOR / NEO_SCALE - 1;
 	}else{ // 0
-		ca->ready_rate = ca->rate;
+		ca->ready_cwnd = ca->cwnd;
 	}
 }
 
@@ -448,8 +485,13 @@ static void neo_init(struct sock *sk)
 
 	id++;
 	ca->id = id;
-	ca->rate = NEO_RATE_MIN * 512;
-	ca->ready_rate = NEO_RATE_MIN * 512;
+	ca->cwnd = tp->snd_cwnd;
+	ca->ready_cwnd = tp->snd_cwnd;
+
+	// ca->rate = NEO_RATE_MIN * 512;
+	// ca->ready_rate = NEO_RATE_MIN * 512;
+
+
 	// ca->last_used_cwnd = 10U;
 
 	ca->send_index = 0;
@@ -497,17 +539,17 @@ static u32 neo_ssthresh(struct sock *sk)
 	struct tcp_sock *tp = tcp_sk(sk);
 	// we want RL to take more efficient control
 	struct neo_data *ca = inet_csk_ca(sk);
-	u64 rate;
+	u64 cwnd;
 
 	if (!ca->slow_start_passed){
 		ca->slow_start_passed = 1;
 		tp->snd_cwnd = tp->snd_cwnd * 717 / 1000;
 		neo_update_pacing_rate(sk);
 		// ca->last_used_cwnd = cwnd;
-		rate = sk->sk_pacing_rate;
-		ca->intervals[0].rate = rate;
-		ca->ready_rate = rate;
-		ca->rate = rate;
+		cwnd = tp->snd_cwnd;
+		ca->intervals[0].cwnd = cwnd;
+		ca->ready_cwnd = cwnd;
+		ca->cwnd = cwnd;
 	}
 	ca->prior_cwnd = tp->snd_cwnd;
 	return max(tp->snd_cwnd, 10U);
@@ -562,20 +604,20 @@ static void slow_set_cwnd(struct sock *sk, u32 acked)
 
 }
 
-u32 neo_slow_start(struct sock *sk, u32 acked)
-{
-	struct tcp_sock *tp = tcp_sk(sk);
-	struct neo_data *ca = inet_csk_ca(sk);
-	u64 rate;
-	ca->cnt += acked * 500;
-	slow_set_cwnd(sk, acked);
-	neo_update_pacing_rate(sk);
+// u32 neo_slow_start(struct sock *sk, u32 acked)
+// {
+// 	struct tcp_sock *tp = tcp_sk(sk);
+// 	struct neo_data *ca = inet_csk_ca(sk);
+// 	u64 rate;
+// 	ca->cnt += acked * 500;
+// 	slow_set_cwnd(sk, acked);
+// 	neo_update_pacing_rate(sk);
 
-	rate = sk->sk_pacing_rate;
-	ca->intervals[0].rate = rate;
-	ca->ready_rate = rate;
-	ca->rate = rate;
-}
+// 	rate = sk->sk_pacing_rate;
+// 	ca->intervals[0].rate = rate;
+// 	ca->ready_rate = rate;
+// 	ca->rate = rate;
+// }
 
 static void neo_cong_control(struct sock *sk, const struct rate_sample *rs)
 {
