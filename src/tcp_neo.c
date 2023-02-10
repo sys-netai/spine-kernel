@@ -433,17 +433,24 @@ void neo_set_params(struct spine_connection *conn, u64 *params, u8 num_fields)
 			num_fields);
 		return;
 	}
-	if (params[0] == 1){
-		ca->ready_cwnd = ca->cwnd * NEO_ACTION_INCREASE / NEO_SCALE + 1;
-	}else if (params[0] == 2){
-		ca->ready_cwnd = ca->cwnd * NEO_ACTION_DECREASE / NEO_SCALE - 1;
-	// }else if (params[0] == 3){
-	// 	ca->ready_rate = ca->rate * NEO_ACTION_INCREASE_MINOR / NEO_SCALE + 1;
-	// }else if (params[0] == 4){
-	// 	ca->ready_rate = ca->rate * NEO_ACTION_DECREASE_MINOR / NEO_SCALE - 1;
-	}else{ // 0
+	if (params[0] > NEO_SCALE){
+		ca->ready_cwnd = ca->cwnd * params[0] / NEO_SCALE + 1;
+	}else if (params[0] < NEO_SCALE){
+		ca->ready_cwnd = ca->cwnd * params[0] / NEO_SCALE - 1;
+	}else{
 		ca->ready_cwnd = ca->cwnd;
 	}
+	// if (params[0] == 1){
+	// 	ca->ready_cwnd = ca->cwnd * NEO_ACTION_INCREASE / NEO_SCALE + 1;
+	// }else if (params[0] == 2){
+	// 	ca->ready_cwnd = ca->cwnd * NEO_ACTION_DECREASE / NEO_SCALE - 1;
+	// // }else if (params[0] == 3){
+	// // 	ca->ready_rate = ca->rate * NEO_ACTION_INCREASE_MINOR / NEO_SCALE + 1;
+	// // }else if (params[0] == 4){
+	// // 	ca->ready_rate = ca->rate * NEO_ACTION_DECREASE_MINOR / NEO_SCALE - 1;
+	// }else{ // 0
+	// 	ca->ready_cwnd = ca->cwnd;
+	// }
 }
 
 
@@ -552,7 +559,7 @@ static u32 neo_ssthresh(struct sock *sk)
 		ca->cwnd = cwnd;
 	}
 	ca->prior_cwnd = tp->snd_cwnd;
-	return max(tp->snd_cwnd, 10U);
+	return max(tp->snd_cwnd, 32U);
 }
 
 static void neo_set_state(struct sock *sk, u8 new_state)

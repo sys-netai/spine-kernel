@@ -145,8 +145,12 @@ def read_unix_message(unix_sock: IPCSocket):
 
     flow_id = active_flow_map.get_flowId_by_port(port)
     assert flow_id != None
-
-    if msg_type == UnixMessageType.END.value:
+    if msg_type == UnixMessageType.TERMINATE.value:
+        active_flow_map.remove_all_env_flows()
+        # deregister env
+        env_flows.release_env(env_id)
+        return ReturnStatus.Cancel
+    elif msg_type == UnixMessageType.END.value:
         # we need the dsr_port id to remove the cache
         sock_id = active_flow_map.get_sockId_by_flowId(flow_id)
         log.info("flow exits with port: {}".format(port)) 

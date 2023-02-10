@@ -30,7 +30,7 @@ class Flow(object):
         self.congAlg = msg.congAlg
 
         # key in flow map
-        self.sock_id = hdr.sock_id
+        self.sock_id = hdr.sock_id # * self.dst_port 
         return self
 
 
@@ -75,8 +75,22 @@ class ActiveFlowMap(object):
             self.try_associate(flow)
             return True
         else:
-            log.warn("flow already exists: {}".format(flow.sock_id))
-            return False
+            log.warn("flow already exists: {}, but...".format(flow.sock_id))
+            self.kernel_flows[flow.sock_id] = flow
+            log.debug(
+                "env: {} add kernel flow: {} with init_cwnd: {},src_ip: {}, src_port: {}, dst_ip: {}, dst_port: {}".format(
+                    self.env_id,
+                    flow.sock_id,
+                    flow.init_cwnd,
+                    ipaddress.IPv4Address(flow.src_ip),
+                    flow.src_port,
+                    ipaddress.IPv4Address(flow.dst_ip),
+                    flow.dst_port,
+                )
+            )
+            self.try_associate(flow)
+            return True
+            # return False
 
     def add_flow_with_dst_port(self, port, flow_id):
         if not port in self.dst_port_to_flow_id:
