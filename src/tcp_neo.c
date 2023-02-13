@@ -12,6 +12,7 @@
 /* all parameters are devided by 1024 */
 #define NEO_SCALE 1000
 #define CWND_GAIN 1200
+#define NEO_ACTION_SLOW_START 1100
 #define NEO_ACTION_INCREASE 1025
 #define NEO_ACTION_DECREASE 976
 // #define NEO_ACTION_INCREASE_MINOR 1010
@@ -20,7 +21,7 @@
 
 #define NEO_IGNORE_PACKETS 5
 
-#define NEO_INTERVALS 20
+#define NEO_INTERVALS 100
 #define MONITOR_INTERVAL 30000
 #define NEO_RATE_MIN 4096u
 
@@ -145,7 +146,7 @@ void neo_calculate_and_set_cwnd(struct sock *sk, struct neo_data *neo,
 	// }
 	new_cwnd = neo->ready_cwnd; // * (num + 1) - rate_sum;
 	new_cwnd = max(4ULL, new_cwnd);
-	new_cwnd = min((u32)new_cwnd, tp->snd_cwnd_clamp); /* apply cap */
+	new_cwnd = min((u32)new_cwnd,  tp->snd_cwnd_clamp); /* apply cap */
 	interval->cwnd = new_cwnd;
 	neo->cwnd = new_cwnd;
 	neo->ready_cwnd = new_cwnd; // in case no action is given. reuse the previous cwnd.
@@ -441,7 +442,10 @@ void neo_set_params(struct spine_connection *conn, u64 *params, u8 num_fields)
 	// 	ca->ready_rate = ca->rate * NEO_ACTION_INCREASE_MINOR / NEO_SCALE + 1;
 	// }else if (params[0] == 4){
 	// 	ca->ready_rate = ca->rate * NEO_ACTION_DECREASE_MINOR / NEO_SCALE - 1;
-	}else{ // 0
+	}else if (params[0] == 3){
+		ca->ready_cwnd = ca->cwnd * NEO_ACTION_SLOW_START / NEO_SCALE + 1;
+	}
+	else{ // 0
 		ca->ready_cwnd = ca->cwnd;
 	}
 	// pr_info("Ready cwnd:. %d %d %d", ca->cwnd, params[0], ca->ready_cwnd);
