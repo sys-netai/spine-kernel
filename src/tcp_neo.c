@@ -13,10 +13,13 @@
 #define NEO_SCALE 1000
 #define CWND_GAIN 1200
 #define NEO_ACTION_SLOW_START 1100
-#define NEO_ACTION_INCREASE 1025
-#define NEO_ACTION_DECREASE 976
+#define NEO_ACTION_INCREASE 1050//1025
+#define NEO_ACTION_DECREASE 952//976
 // #define NEO_ACTION_INCREASE_MINOR 1010
 // #define NEO_ACTION_DECREASE_MINOR 990
+#define NEO_ACTION_RTT_UPPERBOUND 1100
+#define NEO_ACTION_RTT_LOWERBOUND 905
+
 #define NEO_PARAM_NUM 1
 
 #define NEO_IGNORE_PACKETS 5
@@ -69,7 +72,6 @@ struct neo_data {
 	u64 cwnd;
 	u64 ready_cwnd;
 
-
 	u32 lost_base; /* previously lost packets */
 	u32 delivered_base; /* previously delivered packets */
 
@@ -81,6 +83,8 @@ struct neo_data {
 	u32 prior_cwnd;
 
 	bool first_circle;
+
+	// u32 mono_count;
 
 	int id;
 	/* communication */
@@ -101,11 +105,12 @@ static u32 get_next_index(u32 index)
 	return 0;
 }
 
-static u32 get_previous_index(u32 index)
+static u32 get_previous_index(u32 index, u32 step)
 {
-	if (index > 0)
-		return index - 1;
-	return NEO_INTERVALS - 1;
+	if (index > step - 1)
+		return index - step;
+	else
+		return NEO_INTERVALS - (step - index);
 }
 
 /*********************
@@ -180,11 +185,20 @@ void neo_calculate_and_set_cwnd(struct sock *sk, struct neo_data *neo,
 // 	// 	} while (idx != send_idx);
 // 	// }
 // 	new_rate = neo->ready_rate; // * (num + 1) - rate_sum;
+// 	// print ready_rate
+// 	// pr_info("The ready rate is %llu\n", new_rate);
 // 	new_rate = max(new_rate, NEO_RATE_MIN);
 // 	new_rate = min(new_rate, sk->sk_max_pacing_rate);
 // 	interval->rate = new_rate;
-// 	neo->rate = new_rate;
-// 	neo->ready_rate = new_rate; // in case no action is given. reuse the previous cwnd.
+// 	// neo->rate = new_rate;
+// 	if(neo->counter_id == 0){
+// 		// fixed rate
+// 		pr_info( "Counter id is 0, fixed rate is 6.25MBps");
+// 		neo->ready_rate = 6250000;}
+// 	else{
+// 		//increasing rate each time by 1.1
+// 		pr_info("Counter id is 1, increasing rate by 1.1 each time. Current rate is %llu",)
+// 		neo->ready_rate = (neo->ready_rate * 1100) / 1000;}
 // 	sk->sk_pacing_rate = new_rate;
 // 	// pr_info("The ready rate is %llu, and the new rate is thus %llu, the ratio is %d", neo->ready_cwnd, new_rate, new_rate/neo->ready_cwnd);
 	
@@ -371,7 +385,7 @@ void neo_fetch_measurements(struct spine_connection *conn,
 	get_sock_from_spine(&sk, conn);
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct neo_data *neo = inet_csk_ca(sk);
-	*num_fields = 10;
+	*num_fields = 12;
 	if (neo->first_circle && neo->receive_index < 2) {
 		measurements[0] = 0;
 		measurements[1] = 0;
@@ -383,10 +397,12 @@ void neo_fetch_measurements(struct spine_connection *conn,
 		measurements[7] = 0;
 		measurements[8] = 0;
 		measurements[9] = 0;
+		measurements[10] = 0;
+		measurements[11] = 0;
 		return;
 	}
-	int last_received_id = get_previous_index(neo->receive_index);
-	int last_last_received_id = get_previous_index(last_received_id);
+	int last_received_id = get_previous_index(neo->receive_index, 1u);
+	int last_last_received_id = get_previous_index(last_received_id, 1u);
 	// neo->last_used_cwnd = neo->intervals[last_received_id].cwnd;
 
 	// pr_info("For the last interval: rate: %llu, lost: %llu; delivered: %llu; start_Rtt:%llu, end_rtt:%llu. send_start:%llu, send_end:%llu, recv_start:%llu, recv_end:%llu ", 
@@ -411,6 +427,10 @@ void neo_fetch_measurements(struct spine_connection *conn,
 		    neo->intervals[last_received_id].recv_start;	
 	measurements[9] = neo->intervals[last_last_received_id].recv_end-
 		    neo->intervals[last_last_received_id].recv_start;	
+	measurements[10] = neo->intervals[last_received_id].send_end -
+		    neo->intervals[last_received_id].send_start;	
+	measurements[11] = neo->intervals[last_last_received_id].send_end-
+		    neo->intervals[last_last_received_id].send_start;	
 }
 
 /**
@@ -419,6 +439,7 @@ void neo_fetch_measurements(struct spine_connection *conn,
 void neo_set_params(struct spine_connection *conn, u64 *params, u8 num_fields)
 {
 	struct sock *sk;
+	int recent_rtt;
 	// struct tcp_sock *tp = tcp_sk(sk);
 	get_sock_from_spine(&sk, conn);
 	struct neo_data *ca = inet_csk_ca(sk);
@@ -434,32 +455,54 @@ void neo_set_params(struct spine_connection *conn, u64 *params, u8 num_fields)
 			num_fields);
 		return;
 	}
-	if (params[0] == 1){
-		ca->ready_cwnd = ca->cwnd * NEO_ACTION_INCREASE / NEO_SCALE + 1;
-	}else if (params[0] == 2){
-		ca->ready_cwnd = ca->cwnd * NEO_ACTION_DECREASE / NEO_SCALE - 1;
-	// }else if (params[0] == 3){
-	// 	ca->ready_rate = ca->rate * NEO_ACTION_INCREASE_MINOR / NEO_SCALE + 1;
-	// }else if (params[0] == 4){
-	// 	ca->ready_rate = ca->rate * NEO_ACTION_DECREASE_MINOR / NEO_SCALE - 1;
-	}else if (params[0] == 3){
-		ca->ready_cwnd = ca->cwnd * NEO_ACTION_SLOW_START / NEO_SCALE + 1;
-	}
-	else{ // 0
-		ca->ready_cwnd = ca->cwnd;
-	}
-	// pr_info("Ready cwnd:. %d %d %d", ca->cwnd, params[0], ca->ready_cwnd);
+	// // get the recent RTT
+	// recent_rtt = ca->intervals[ca->receive_index].start_rtt;
+	// // how many intervals before for a RTT?
+	// int interval_per_rtt = recent_rtt / MONITOR_INTERVAL;
+	// if (interval_per_rtt == 0){
+	// 	interval_per_rtt = 1;
+	// }
+	// int last_interval_id = get_previous_index(ca->receive_index, 1);
+	// int last_last_interval_id = get_previous_index(ca->receive_index, 2);
+	// // record whether the cwnd is motonic increasing or decreasing
+	// bool is_previous_increasing = (ca->intervals[last_interval_id].cwnd - ca->intervals[last_last_interval_id].cwnd) > 0;
+	// bool is_still_increasing = (ca->intervals[ca->receive_index].cwnd - ca->intervals[last_interval_id].cwnd) > 0;
+
+	// if (!(is_previous_increasing ^ is_still_increasing)) // if the trend is not changed
+	// {
+	// 	// add ca->mono_count
+	// 	ca->mono_count += 1;
+	// }
+	// else
+	// {
+	// 	ca->mono_count = 1;
+	// }
 	// if (params[0] == 1){
-	// 	ca->ready_cwnd = ca->cwnd * NEO_ACTION_INCREASE / NEO_SCALE + 1;
+	// 	int increase_scale = (NEO_ACTION_INCREASE - NEO_SCALE) * min(ca->mono_count, interval_per_rtt);
+	// 	ca->ready_cwnd = ca->cwnd *  (NEO_SCALE + increase_scale / interval_per_rtt) / NEO_SCALE + 1;
 	// }else if (params[0] == 2){
-	// 	ca->ready_cwnd = ca->cwnd * NEO_ACTION_DECREASE / NEO_SCALE - 1;
-	// // }else if (params[0] == 3){
-	// // 	ca->ready_rate = ca->rate * NEO_ACTION_INCREASE_MINOR / NEO_SCALE + 1;
-	// // }else if (params[0] == 4){
-	// // 	ca->ready_rate = ca->rate * NEO_ACTION_DECREASE_MINOR / NEO_SCALE - 1;
-	// }else{ // 0
+	// 	int decrease_scale = (NEO_SCALE - NEO_ACTION_DECREASE) * min(ca->mono_count, interval_per_rtt);
+	// 	ca->ready_cwnd = ca->cwnd *  (NEO_SCALE - decrease_scale / interval_per_rtt) / NEO_SCALE - 1;
+	// }else if (params[0] == 3){
+	// 	ca->ready_cwnd = ca->cwnd * NEO_ACTION_SLOW_START / NEO_SCALE + 1;
+	// }
+	// else{
 	// 	ca->ready_cwnd = ca->cwnd;
 	// }
+	if (params[0] == 1){
+		int increase_scale = (NEO_ACTION_INCREASE - NEO_SCALE);
+		ca->ready_cwnd = ca->cwnd *  (NEO_SCALE + increase_scale) / NEO_SCALE + 1;
+	}else if (params[0] == 2){
+		int decrease_scale = (NEO_SCALE - NEO_ACTION_DECREASE);
+		ca->ready_cwnd = ca->cwnd *  (NEO_SCALE - decrease_scale) / NEO_SCALE - 1;
+	}else if (params[0] == 3){
+		ca->ready_cwnd = ca->cwnd * NEO_ACTION_SLOW_START / NEO_SCALE + 1;
+	}else if (params[0] > 3){
+		ca->ready_cwnd = params[0];
+	}
+	else{
+		ca->ready_cwnd = ca->cwnd;
+	}
 }
 
 
@@ -501,7 +544,7 @@ static void neo_init(struct sock *sk)
 
 	id++;
 	ca->id = id;
-	tp->snd_cwnd = 64; // init value
+	tp->snd_cwnd = 16;//64; // init value
 	ca->cwnd = tp->snd_cwnd;
 	ca->ready_cwnd = tp->snd_cwnd;
 	// ca->rate = NEO_RATE_MIN * 512;
@@ -510,6 +553,7 @@ static void neo_init(struct sock *sk)
 
 	// ca->last_used_cwnd = 10U;
 
+	// ca->mono_count = 1;
 	ca->send_index = 0;
 	ca->receive_index = 0;
 	ca->first_circle = true;
