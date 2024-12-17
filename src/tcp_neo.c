@@ -284,6 +284,7 @@ bool send_interval_ended(struct neo_interval *interval, struct tcp_sock *tsk,
 	u64 now = tsk->tcp_mstamp;
 	if (now - interval->send_start >= MONITOR_INTERVAL) {
 		interval->packets_ended = tsk->data_segs_out;
+		// pr_info ("The send interval ended, packets_ended: %d, data_segs_out: %d", interval->packets_ended, tsk->data_segs_out);
 		return true;
 	} else
 		return false;
@@ -295,8 +296,12 @@ bool send_interval_ended(struct neo_interval *interval, struct tcp_sock *tsk,
 bool receive_interval_ended(struct neo_interval *interval, struct tcp_sock *tsk,
 			    struct neo_data *neo)
 {
-	return interval->packets_ended &&
-	       interval->packets_ended - NEO_IGNORE_PACKETS < neo->packets_counted;
+	// if current time - the rtt of the last packet > send_end time, then the interval is ended.
+	// pr_info ("The current time is %llu, the rtt of the last packet is %llu, the send_end is %llu", tsk->tcp_mstamp, tsk->rack.rtt_us , interval->send_end);
+	return tsk->tcp_mstamp - tsk->rack.rtt_us > interval->send_end;	
+	
+	// return interval->packets_ended &&
+	//        interval->packets_ended - NEO_IGNORE_PACKETS < neo->packets_counted;
 }
 
 /* Start the next interval's sending stage.
@@ -348,18 +353,18 @@ void neo_process(struct sock *sk)
 	before = neo->packets_counted;
 	neo->packets_counted = tsk->delivered + tsk->lost -
 				neo->double_counted;
-	if (before > NEO_IGNORE_PACKETS + interval->packets_sent_base) {
-		// pr_info("update %d-th recv inverval.", index);
-		neo_update_interval(interval, neo, sk);
-	}
 	if (receive_interval_ended(interval, tsk, neo)) {
-		// pr_info("recving inverval ended id: %d, start the next receive at time %llu.", index, tsk->tcp_mstamp);
+		// pr_info("recving inverval ended packet sent base: %d, packets_ended: %d, packets_counted: %d, double_counted: %d", interval->packets_sent_base, interval->packets_ended, neo->packets_counted, neo->double_counted);
+		// pr_info("data_segs_in: %d, data_segs_out: %d, delivered: %d, lost: %d", tsk->data_segs_in, tsk->data_segs_out, tsk->delivered, tsk->lost);
 		neo->receive_index = get_next_index(index);
 		interval = &neo->intervals[neo->receive_index];
 		interval->recv_start = tcp_sk(sk)->tcp_mstamp;
 		interval->start_rtt = tcp_sk(sk)->srtt_us >> 3;
 		if (neo->receive_index == 0)
 			neo->first_circle = false;
+	}else{
+		// pr_info("update %d-th recv inverval. the packet count is %d, the double_counted is %d", index, neo->packets_counted, neo->double_counted);
+		neo_update_interval(interval, neo, sk);
 	}
 }
 
@@ -426,6 +431,13 @@ void neo_fetch_measurements(struct spine_connection *conn,
 	measurements[5] = neo->intervals[last_last_received_id].packets_ended -  neo->intervals[last_last_received_id].packets_sent_base; 
 	measurements[6] = neo->intervals[last_received_id].end_rtt;
 	measurements[7]	= neo->intervals[last_received_id].start_rtt;
+	// // output rece and send start and end times
+	// pr_info ("The last interval: send_start: %llu, send_end: %llu, recv_start: %llu, recv_end: %llu", neo->intervals[last_received_id].send_start, neo->intervals[last_received_id].send_end, neo->intervals[last_received_id].recv_start, neo->intervals[last_received_id].recv_end);
+	// // output their differences
+	// pr_info ("The last interval: send_diff: %llu, recv_diff: %llu", neo->intervals[last_received_id].send_end - neo->intervals[last_received_id].send_start, neo->intervals[last_received_id].recv_end - neo->intervals[last_received_id].recv_start);
+	// pr_info ("The difference between send_end and recev_start: %llu", neo->intervals[last_received_id].send_end - neo->intervals[last_received_id].recv_start);
+	// pr_info ( "The difference between send_end and recev_end: %llu", neo->intervals[last_received_id].recv_end - neo->intervals[last_received_id].send_end);
+
 	measurements[8] = neo->intervals[last_received_id].recv_end -
 		    neo->intervals[last_received_id].recv_start;	
 	measurements[9] = neo->intervals[last_last_received_id].recv_end-
@@ -721,7 +733,7 @@ static void neo_cong_control(struct sock *sk, const struct rate_sample *rs)
 	if (rs->delivered < 0 || rs->interval_us < 0) {
 		goto end;
 	}
-
+	// pr_info("The acked is %d, the delivered is %d, the interval_us is %d", rs->acked_sacked, rs->delivered, rs->interval_us);
 	neo_process(sk);
 	// printk(KERN_INFO "[NEO] Get into control1.\n");
 	// call spine to update parameters if needed
