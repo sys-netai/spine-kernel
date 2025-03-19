@@ -5,6 +5,13 @@ import struct
 
 from logger import logger as log
 
+# coherent with the kernel side as follows in serialize.h
+#define CREATE 0
+#define MEASURE 1
+#define INSTALL_EXPR 2
+#define UPDATE_FIELDS 3
+#define CHANGE_PROG 4
+#define READY 5
 # message types
 NL_CREATE = 0
 NL_MEASURE = 1

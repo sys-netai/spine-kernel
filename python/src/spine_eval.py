@@ -224,7 +224,7 @@ def polling():
             # just sleep for a while (10ms)
             
             #print("CURRENT POLLER ACTION in polling:", poller.get_all_actions())
-            time.sleep(0.01)
+            time.sleep(0.005)
 
 
 def main(args):

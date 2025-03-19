@@ -9,6 +9,9 @@ import threading
 import functools
 from functools import partial
 
+# flow id comes from the unix socket
+# sock id comes from the kernel
+# port id comes from the env, which is coherent as the flows are initizlied by the env
 
 from logger import logger as log
 from message import *
@@ -23,6 +26,7 @@ import msg_sender
 nl_sock = None
 # communication between spine-user-space and Env
 unix_sock = None
+# the unix socks with key as sock_id come from the kernel
 client_from_sock = dict()
 # kernel cc alg
 kernel_cc = None
@@ -88,18 +92,34 @@ def read_netlink_message(nl_sock: Netlink):
         active_flow_map.add_flow_with_sockId(flow)
         # cache sockID with envid
         env_flows.bind_sock_id_to_env(flow.sock_id, env_id)
+        # print ("add flow with sock_id: ", flow.sock_id)
+        # print ("add flow with flow_id: ", active_flow_map.get_flowId_by_sockId(flow.sock_id))
+        # print ("add flow with dst_port: ", flow.dst_port)
         return ReturnStatus.Continue
     elif hdr.type == NL_READY:
         log.info("Spine kernel is ready!!")
     elif hdr.type == NL_MEASURE:
         sock_id = hdr.sock_id
-        # print("get a new measure from sock id:", sock_id, client_from_sock[sock_id])
         msg = MeasureMsg()
         msg.from_raw(hdr_raw[hdr.hdr_len :])
         msg_to_unix = {}
         msg_to_unix["type"] = UnixMessageType.MEASURE.value
         msg_to_unix["data"] = msg.data
         msg_to_unix["request_id"] = msg.request_id
+        # print the time, flow_id, and data
+        # print ("read netlink message: ", time.time(), msg.data)
+        # first find env
+        env_id = env_flows.sock_id_to_env_id.get(sock_id, None)
+        if env_id == None:
+            log.warn("unknown dst_port: {}".format(flow.dst_port))
+            return ReturnStatus.Continue
+        active_flow_map = env_flows.get_env_flows(env_id)
+        flow_id = active_flow_map.get_flowId_by_sockId(sock_id)
+        # print("get a new measure from flow {}!".format(flow_id))
+        if flow_id == None:
+            print("Warning: a none flow_id")
+            return ReturnStatus.Continue
+        # msg_to_unix["flow_id"] = flow_id
         client_sock = client_from_sock[sock_id]
         sent = client_sock.write(json.dumps(msg_to_unix))
         if sent == 0:
@@ -147,18 +167,38 @@ def read_unix_message(unix_sock: IPCSocket):
         env_flows.release_port_to_env(port)
         return ReturnStatus.Continue
     elif msg_type == UnixMessageType.MEASURE.value:
+        # print the time, flow_id 
+        # print ("read unix message: ", time.time(), flow_id)
         # we need the dsr_port id to remove the cache
         sock_id = active_flow_map.get_sockId_by_flowId(flow_id)
-        client_from_sock[sock_id] = unix_sock # cache the client socket
+        client_from_sock[sock_id] = unix_sock # cache the client socket, however, the current unix socket is unique for an env.
         # print("get a new measure request from unix! update the sock dict:", sock_id, unix_sock)
         assert nl_send != None
         if data["request_id"] is None:
             return ReturnStatus.Continue
-        # we generally don't need request-id to align request and reply, as the neo_get_state is blocking.
+        # request id is used for aligning measurements request and reply at the env
+        # We don't need request-id to align request and reply if the neo_get_state is blocking.
+        
         if sock_id == None:
-            print("Warning: a none sock_id")
+            print("Warning: a none sock_id at time {} during unix reading".format(time.time()))
             return ReturnStatus.Continue
         nl_send(data["request_id"], nl_sock, sock_id, msg_type=NL_MEASURE)
+        return ReturnStatus.Continue
+    elif msg_type == UnixMessageType.OBSERVE.value:
+        # print("get a new observe request from unix!")
+        # send to all flows
+        for flow_id in active_flow_map.get_all_flow_ids():
+            print("flow: ", flow_id)
+            sock_id = active_flow_map.get_sockId_by_flowId(flow_id)
+            if sock_id == None:
+                print("Warning: a none sock_id when observing, flow id:", flow_id)
+                return ReturnStatus.Continue
+            client_from_sock[sock_id] = unix_sock
+            assert nl_send != None
+            if data["request_id"] is None:
+                return ReturnStatus.Continue
+            # print("send to flow: ", flow_id)
+            nl_send(data["request_id"], nl_sock, sock_id, msg_type=NL_MEASURE)
         return ReturnStatus.Continue
     # message should be ALIVE
     if msg_type != UnixMessageType.ALIVE.value:

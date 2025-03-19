@@ -218,6 +218,7 @@ int spine_invoke(struct spine_connection *conn)
 			}
 		} else {
 			spine_conn_create_success(state);
+			spine_info("connection %d retx create message", conn->index);
 		}
 		return SPINE_OK;
 	}
@@ -228,6 +229,7 @@ int spine_invoke(struct spine_connection *conn)
 			params[i] = state->pending_update.control_registers[i];
 			num_params += 1;
 		} else {
+			// spine_info("no more staged parameters");
 			// there are no remaining staged parameters, we stop here
 			break;
 		}
@@ -328,6 +330,7 @@ int send_measurement(struct spine_connection *conn, u32 request_id, u64 *fields,
 	msg_size = write_measure_msg(msg, REPORT_MSG_SIZE, conn->index,
 				     request_id, fields, num_fields);
 	spine_trace("[sid=%d] In %s\n", conn->index, __FUNCTION__);
+	spine_debug("really sent measuremen");
 	ret = conn->datapath->send_msg(datapath, msg, msg_size);
 	if (ret) {
 		spine_debug("error sending measurement, updating fto timer");

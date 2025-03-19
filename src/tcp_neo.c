@@ -391,7 +391,7 @@ void neo_fetch_measurements(struct spine_connection *conn,
 	get_sock_from_spine(&sk, conn);
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct neo_data *neo = inet_csk_ca(sk);
-	*num_fields = 14;
+	*num_fields = 15;
 	if (neo->first_circle && neo->receive_index < 2) {
 		measurements[0] = 0;
 		measurements[1] = 0;
@@ -413,16 +413,16 @@ void neo_fetch_measurements(struct spine_connection *conn,
 	int last_last_received_id = get_previous_index(last_received_id, 1u);
 	// neo->last_used_cwnd = neo->intervals[last_received_id].cwnd;
 
-	// pr_info("For the last interval: rate: %llu, lost: %llu; delivered: %llu; start_Rtt:%llu, end_rtt:%llu. send_start:%llu, send_end:%llu, recv_start:%llu, recv_end:%llu ", 
-	// 				neo->intervals[last_received_id].rate,
-	// 				neo->intervals[last_received_id].lost,
-	// 				neo->intervals[last_received_id].delivered,
-	// 				neo->intervals[last_received_id].start_rtt,
-	// 				neo->intervals[last_received_id].end_rtt,
-	// 				neo->intervals[last_received_id].send_start,
-	// 				neo->intervals[last_received_id].send_end,
-	// 				neo->intervals[last_received_id].recv_start,
-	// 				neo->intervals[last_received_id].recv_end);
+	//pr_info("For the last interval: rate: %llu, lost: %llu; delivered: %llu; start_Rtt:%llu, end_rtt:%llu. send_start:%llu, send_end:%llu, recv_start:%llu, recv_end:%llu ", 
+					// neo->intervals[last_received_id].rate,
+					// neo->intervals[last_received_id].lost,
+					// neo->intervals[last_received_id].delivered,
+					// neo->intervals[last_received_id].start_rtt,
+					// neo->intervals[last_received_id].end_rtt,
+					// neo->intervals[last_received_id].send_start,
+					// neo->intervals[last_received_id].send_end,
+					// neo->intervals[last_received_id].recv_start,
+					// neo->intervals[last_received_id].recv_end);
 	measurements[0] = neo->intervals[last_received_id].delivered;
 	measurements[1] = neo->intervals[last_last_received_id].delivered;
 	measurements[2] = neo->intervals[last_received_id].lost;
@@ -449,6 +449,8 @@ void neo_fetch_measurements(struct spine_connection *conn,
 	// cwnd
 	measurements[12] = neo->intervals[last_received_id].cwnd;
 	measurements[13] = neo->intervals[last_last_received_id].cwnd;
+	// current cwnd
+	measurements[14] = neo->cwnd;
 }
 
 /**

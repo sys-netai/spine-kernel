@@ -40,11 +40,16 @@ class ActiveFlowMap(object):
         self.kernel_flows = dict()
         # key is flow id (assigned by Env), value is sock id
         self.flow_id_to_sock_id = dict()
+        self.sock_id_to_flow_id = dict()
         # key is dst_port, value is flow id
         self.dst_port_to_flow_id = dict()
         # key is flow_id, value is dst_port
         self.flow_id_to_dst_port = dict()
+         
         self.env_id = None
+
+    def get_all_flow_ids(self):
+        return self.flow_id_to_sock_id.keys()
 
     def try_associate(self, flow: Flow):
         if flow.dst_port in self.dst_port_to_flow_id:
@@ -52,6 +57,7 @@ class ActiveFlowMap(object):
             flow_id = self.dst_port_to_flow_id[flow.dst_port]
             if flow_id not in self.flow_id_to_sock_id:
                 self.flow_id_to_sock_id[flow_id] = flow.sock_id
+                self.sock_id_to_flow_id[flow.sock_id] = flow_id
                 log.debug(
                     "associate env: {} flow id: {} with kernel sock id: {}".format(
                         self.env_id, flow_id, flow.sock_id
@@ -100,6 +106,21 @@ class ActiveFlowMap(object):
                     self.env_id, flow_id, port
                 )
             )
+            
+    def add_flowid_with_sockid(self, flow_id, sock_id):
+        if not flow_id in self.flow_id_to_sock_id:
+            self.flow_id_to_sock_id[flow_id] = sock_id
+            log.debug(
+                "register env {} flow: {} with sock_id: {}".format(
+                    self.env_id, flow_id, sock_id
+                )
+            )
+            
+    def get_flowId_by_sockId(self, sock_id):
+        if sock_id in self.sock_id_to_flow_id:
+            return self.sock_id_to_flow_id[sock_id]
+        else:
+            return None
 
     def get_sockId_by_flowId(self, flow_id):
         if flow_id in self.flow_id_to_sock_id:
