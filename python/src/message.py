@@ -41,6 +41,9 @@ VANILLA_DELTA_REG = 3
 # registers for Neo Parameters
 NEO_ACTION_REG = 0
 
+# registers for Policycache Parameters
+POLICYCACHE_ACTION_REG = 0
+
 # some length of message
 SPINE_HEADER_LEN = 8
 SPINE_CREATE_LEN = 88

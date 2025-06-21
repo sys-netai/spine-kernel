@@ -1,6 +1,6 @@
 #!/bin/bash
 
-module=${1:-"neo"}
+module=${1:-"policycache"}
 mode="664"
 
 if [ "$EUID" -ne 0 ]; then 

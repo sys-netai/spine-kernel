@@ -102,3 +102,31 @@ def send_neo_message(msg_data: dict, nl_sock: Netlink, sock_id, msg_type=None):
         msg_raw = msg.serialize()
         nl_hdr.create(NL_MEASURE, len(msg_raw) + nl_hdr.hdr_len, sock_id)
         nl_sock.send_msg(nl_hdr.serialize() + msg_raw)
+        
+        
+def send_policycache_message(msg_data: dict, nl_sock: Netlink, sock_id, msg_type=None):
+    nl_hdr = SpineMsgHeader()
+    if msg_type == None or msg_type == NL_UPDATE_FIELDS:
+        for key in neo_action_keys:
+            if key not in msg_data:
+                log.error("no such key: {}".format(key))
+                return
+
+        msg = UpdateMsg()
+        for key in neo_action_keys:
+            postfix = key.split("_")[1]
+            reg_name = "NEO_{}_REG".format(postfix.upper())
+            reg = getattr(message, reg_name)
+            msg.add_field(
+                UpdateField().create(VOLATILE_CONTROL_REG, reg, msg_data[key])
+            )
+
+        update_msg = msg.serialize()
+        nl_hdr.create(NL_UPDATE_FIELDS, len(update_msg) + nl_hdr.hdr_len, sock_id)
+        nl_sock.send_msg(nl_hdr.serialize() + update_msg)
+        # log.info("send control to kernel flow: {}".format(sock_id))
+    elif msg_type == NL_MEASURE:
+        msg = MeasureRequestMsg(int(msg_data))
+        msg_raw = msg.serialize()
+        nl_hdr.create(NL_MEASURE, len(msg_raw) + nl_hdr.hdr_len, sock_id)
+        nl_sock.send_msg(nl_hdr.serialize() + msg_raw)

@@ -1,7 +1,7 @@
 
 DEBUG = n
-# by default build vanilla
-TARGET := $(or $(mod), neo)
+# by default build neo
+TARGET := $(or $(mod), policycache)
 
 $(info $$TARGET is [${TARGET}])
 

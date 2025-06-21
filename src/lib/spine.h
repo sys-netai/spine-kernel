@@ -19,7 +19,7 @@ typedef enum {
 	SPINE_CUBIC = 0,
 	SPINE_VEGAS,
 	SPINE_VANILLA,
-	SPINE_NEO
+	SPINE_POLICYCACHE
 } spine_internal_alg;
 
 enum spine_log_level {

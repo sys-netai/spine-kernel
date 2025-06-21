@@ -407,6 +407,7 @@ void neo_fetch_measurements(struct spine_connection *conn,
 		measurements[11] = 0;
 		measurements[12] = 0;
 		measurements[13] = 0;
+		measurements[14] = 0;
 		return;
 	}
 	int last_received_id = get_previous_index(neo->receive_index, 1u);
@@ -534,6 +535,10 @@ void neo_set_params(struct spine_connection *conn, u64 *params, u8 num_fields)
 	else{
 		ca->ready_cwnd = ca->cwnd;
 	}
+	// ready_cwnd cannot be 115% larger than cwnd or smaller than 85% of cwnd, avoiding strange cwnd drop.
+	// ca->ready_cwnd = max(ca->ready_cwnd, ca->cwnd * 85 / 100);
+	// ca->ready_cwnd = min(ca->ready_cwnd, ca->cwnd * 115 / 100);
+
 	// pr_info("params is %llu, ready_cwnd is %llu, cwnd is %llu", params[0], ca->ready_cwnd, ca->cwnd);
 }
 

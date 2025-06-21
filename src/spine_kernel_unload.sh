@@ -1,6 +1,6 @@
 #!/bin/bash
 
-module=${1:-"neo"}
+module=${1:-"policycache"}
 
 if [ "$EUID" -ne 0 ]; then 
     echo "error: must run as root"
