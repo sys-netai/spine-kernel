@@ -515,6 +515,9 @@ void policycache_process(struct sock *sk, const struct rate_sample *rs)
  */
 
 u64 get_gap_between_two_intervals(struct policycache_data *policycache, u32 one_id, u32 another_id	) {
+	if (another_id == 0) {
+		return 0;
+	}
 	s64 gap = (s64)one_id - (s64)another_id;
 	if (gap < 0) {
 		gap = gap + POLICYCACHE_INTERVALS;

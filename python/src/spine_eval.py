@@ -45,7 +45,7 @@ class UnixMessageType(Enum):
     END = 2  # episode end
     ALIVE = 3  # alive status
     OBSERVE = 4  # observe the world
-    TERMINATE = 5  # terminate the env\\
+    TERMINATE = 5  # terminate the env
     MEASURE = 6
 
 
@@ -77,14 +77,10 @@ def read_netlink_message(nl_sock: Netlink):
         log.error("Failed to parse netlink header")
         return ReturnStatus.Cancel
     if hdr.type == NL_CREATE:
+        print("NL_CREATE")
         msg = CreateMsg()
         msg.from_raw(hdr_raw[hdr.hdr_len :])
         flow = Flow().from_create_msg(msg, hdr)
-        # first find env
-        env_id = env_flows.dst_port_to_env_id.get(flow.dst_port, None)
-        if env_id == None:
-            log.warn("unknown dst_port: {}".format(flow.dst_port))
-            return ReturnStatus.Continue
         # register new flow
         active_flow_map = env_flows.get_env_flows(env_id)
         if active_flow_map == None:
@@ -98,6 +94,12 @@ def read_netlink_message(nl_sock: Netlink):
         log.info("Spine kernel is ready!!")
     elif hdr.type == NL_MEASURE:
         sock_id = hdr.sock_id
+        
+        # get the state 
+        # run the double tree here 
+        
+        
+        
         msg = MeasureMsg()
         msg.from_raw(hdr_raw[hdr.hdr_len :])
         msg_to_unix = {}
@@ -133,18 +135,21 @@ def read_unix_message(unix_sock: IPCSocket):
 
     active_flow_map = env_flows.get_env_flows(env_id)
     if active_flow_map is None:
+        print("active_flow_map is None")
         return ReturnStatus.Cancel
-
+    
     if msg_type == UnixMessageType.START.value:
+        # print("START")
         # we also need to record the corresponce of env_id and dst_port
         flow_id = make_flow_id(port)
         env_flows.bind_port_to_env(port, env_id)
         active_flow_map.add_flow_with_dst_port(port, flow_id)
-        log.info("new flow with port: {}, assigned flow id: {}".format(port, flow_id)) 
+        log.info("new flow with port: {}, assigned flow id: {}, env_id: {}".format(port, flow_id, env_id)) 
         return ReturnStatus.Continue
-
+    
     flow_id = active_flow_map.get_flowId_by_port(port)
     assert flow_id != None
+
     if msg_type == UnixMessageType.TERMINATE.value:
         active_flow_map.remove_all_env_flows()
         # deregister env
@@ -153,18 +158,21 @@ def read_unix_message(unix_sock: IPCSocket):
     elif msg_type == UnixMessageType.END.value:
         # we need the dsr_port id to remove the cache
         sock_id = active_flow_map.get_sockId_by_flowId(flow_id)
-        log.info("flow exits with port: {}".format(port)) 
         port = active_flow_map.remove_flow_by_flowId(flow_id)
         # remove cached items
         env_flows.release_port_to_env(port)
         return ReturnStatus.Cancel
     
     elif msg_type == UnixMessageType.MEASURE.value:
+        # print("MEASURE")
+        # print("flow_id:", flow_id)
         # we need the dsr_port id to remove the cache
         sock_id = active_flow_map.get_sockId_by_flowId(flow_id)
+        # print("sock_id:", sock_id)
         client_from_sock[sock_id] = unix_sock # cache the client socket
         assert nl_send != None
         if data["request_id"] is None:
+            print("Warning: a none request_id")
             return ReturnStatus.Continue
         
         if sock_id == None:

@@ -2,15 +2,18 @@ import os
 from socket import socket
 import sys
 from typing import Optional
-
+from enum import Enum
 from message import *
 
+class ValueType(Enum):
+    SOCK_ID = 0
+    FLOW_ID = 1
 
 class Flow(object):
     def __init__(self):
         self.sock_id = -1
         # flow info
-        self.init_cwnd = 0
+        self.init_cwnd = 4
         self.mss = 0
         self.src_ip = 0
         self.src_port = 0
@@ -43,69 +46,86 @@ class ActiveFlowMap(object):
         self.sock_id_to_flow_id = dict()
         # key is dst_port, value is flow id
         self.dst_port_to_flow_id = dict()
-        # key is flow_id, value is dst_port
-        self.flow_id_to_dst_port = dict()
+        self.dst_port_to_sock_id = dict()
          
         self.env_id = None
 
     def get_all_flow_ids(self):
         return self.flow_id_to_sock_id.keys()
 
-    def try_associate(self, flow: Flow):
-        if flow.dst_port in self.dst_port_to_flow_id:
-            # first look up flow id from send port
-            flow_id = self.dst_port_to_flow_id[flow.dst_port]
-            if flow_id not in self.flow_id_to_sock_id:
-                self.flow_id_to_sock_id[flow_id] = flow.sock_id
-                self.sock_id_to_flow_id[flow.sock_id] = flow_id
-                log.debug(
-                    "associate env: {} flow id: {} with kernel sock id: {}".format(
-                        self.env_id, flow_id, flow.sock_id
-                    )
-                )
+    def try_associate(self, dst_port, id, value_type):
+        if value_type == ValueType.SOCK_ID:
+            sock_id = id
+            print("try_associate sock id with flow id:", dst_port)
+            if dst_port in self.dst_port_to_flow_id: # flow id already exists for port
+                # first look up flow id from send port
+                flow_id = self.dst_port_to_flow_id[dst_port]
+                self.flow_id_to_sock_id[flow_id] = sock_id
+                self.sock_id_to_flow_id[sock_id] = flow_id
+                print("associate flow id: {} with sock id: {}".format(flow_id, sock_id))
+            else:
+                print("no flow id to associate with sock id:", dst_port, sock_id)
+                # pass
+        elif value_type == ValueType.FLOW_ID:
+            flow_id = id
+            print("try_associate flow id with sock id:", dst_port)
+            if dst_port in self.dst_port_to_sock_id: # sock id already exists for port
+                sock_id = self.dst_port_to_sock_id[dst_port]
+                self.flow_id_to_sock_id[flow_id] = sock_id
+                self.sock_id_to_flow_id[sock_id] = flow_id
+                print("associate flow id: {} with sock id: {}".format(flow_id, sock_id))
+            else:
+                print("no sock id to associate with flow id:", dst_port, flow_id)
+                # pass
 
     def add_flow_with_sockId(self, flow: Flow):
-        if flow.sock_id not in self.kernel_flows:
-            self.kernel_flows[flow.sock_id] = flow
-            log.debug(
-                "env: {} add kernel flow: {} with init_cwnd: {},src_ip: {}, src_port: {}, dst_ip: {}, dst_port: {}".format(
-                    self.env_id,
-                    flow.sock_id,
-                    flow.init_cwnd,
-                    ipaddress.IPv4Address(flow.src_ip),
-                    flow.src_port,
-                    ipaddress.IPv4Address(flow.dst_ip),
-                    flow.dst_port,
+        # print("added flow with sockId:", flow.dst_port, flow.sock_id)
+        if flow.dst_port not in self.dst_port_to_sock_id:
+            self.dst_port_to_sock_id[flow.dst_port] = flow.sock_id
+            if flow.sock_id not in self.kernel_flows:
+                self.kernel_flows[flow.sock_id] = flow
+                log.info(
+                    "env: {} add kernel flow: {} with init_cwnd: {},src_ip: {}, src_port: {}, dst_ip: {}, dst_port: {}".format(
+                        self.env_id,
+                        flow.sock_id,
+                        flow.init_cwnd,
+                        ipaddress.IPv4Address(flow.src_ip),
+                        flow.src_port,
+                        ipaddress.IPv4Address(flow.dst_ip),
+                        flow.dst_port,
+                    )
                 )
-            )
-            self.try_associate(flow)
-            return True
-        else:
-            log.warn("flow already exists: {}, but...".format(flow.sock_id))
-            self.kernel_flows[flow.sock_id] = flow
-            log.debug(
-                "env: {} add kernel flow: {} with init_cwnd: {},src_ip: {}, src_port: {}, dst_ip: {}, dst_port: {}".format(
-                    self.env_id,
-                    flow.sock_id,
-                    flow.init_cwnd,
-                    ipaddress.IPv4Address(flow.src_ip),
-                    flow.src_port,
-                    ipaddress.IPv4Address(flow.dst_ip),
-                    flow.dst_port,
+                self.try_associate(flow.dst_port, flow.sock_id, ValueType.SOCK_ID)
+                return True
+            else:
+                log.warning("flow already exists: {}, but...".format(flow.sock_id))
+                self.kernel_flows[flow.sock_id] = flow
+                log.info(
+                    "env: {} add kernel flow: {} with init_cwnd: {},src_ip: {}, src_port: {}, dst_ip: {}, dst_port: {}".format(
+                        self.env_id,
+                        flow.sock_id,
+                        flow.init_cwnd,
+                        ipaddress.IPv4Address(flow.src_ip),
+                        flow.src_port,
+                        ipaddress.IPv4Address(flow.dst_ip),
+                        flow.dst_port,
+                    )
                 )
-            )
-            self.try_associate(flow)
-            return True
-            # return False
+                self.try_associate(flow.dst_port, flow.sock_id, ValueType.SOCK_ID)
+                return True
+                # return False
 
     def add_flow_with_dst_port(self, port, flow_id):
+        # print("add_flow_with_dst_port:", port, flow_id)
         if not port in self.dst_port_to_flow_id:
             self.dst_port_to_flow_id[port] = flow_id
-            log.debug(
+            # print("port to flow_id:", self.dst_port_to_flow_id)
+            log. debug(
                 "register env {} flow: {} with dst_port: {}".format(
                     self.env_id, flow_id, port
-                )
+                )   
             )
+            self.try_associate(port, flow_id, ValueType.FLOW_ID)
             
     def add_flowid_with_sockid(self, flow_id, sock_id):
         if not flow_id in self.flow_id_to_sock_id:
@@ -140,6 +160,10 @@ class ActiveFlowMap(object):
             port = self.kernel_flows[sock_id].dst_port
             if port in self.dst_port_to_flow_id:
                 self.dst_port_to_flow_id.pop(port)
+            if port in self.dst_port_to_sock_id:
+                self.dst_port_to_sock_id.pop(port)
+            if sock_id in self.sock_id_to_flow_id:
+                self.sock_id_to_flow_id.pop(sock_id)
             log.debug("remove kernel flow: {} for env {}".format(sock_id, self.env_id))
             self.kernel_flows.pop(sock_id)
             return port
