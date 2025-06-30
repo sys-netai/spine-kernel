@@ -56,7 +56,7 @@ class ActiveFlowMap(object):
     def try_associate(self, dst_port, id, value_type):
         if value_type == ValueType.SOCK_ID:
             sock_id = id
-            print("try_associate sock id with flow id:", dst_port)
+            print("try_associate sock id with flow id under dst_port:", dst_port)
             if dst_port in self.dst_port_to_flow_id: # flow id already exists for port
                 # first look up flow id from send port
                 flow_id = self.dst_port_to_flow_id[dst_port]
@@ -137,19 +137,19 @@ class ActiveFlowMap(object):
             )
             
     def get_flowId_by_sockId(self, sock_id):
-        if sock_id in self.sock_id_to_flow_id:
+        if sock_id in self.sock_id_to_flow_id.keys():
             return self.sock_id_to_flow_id[sock_id]
         else:
             return None
 
     def get_sockId_by_flowId(self, flow_id):
-        if flow_id in self.flow_id_to_sock_id:
+        if flow_id in self.flow_id_to_sock_id.keys():
             return self.flow_id_to_sock_id[flow_id]
         else:
             return None
 
     def get_flowId_by_port(self, port):
-        if port in self.dst_port_to_flow_id:
+        if port in self.dst_port_to_flow_id.keys():
             return self.dst_port_to_flow_id[port]
         else:
             return None
@@ -162,7 +162,7 @@ class ActiveFlowMap(object):
                 self.dst_port_to_flow_id.pop(port)
             if port in self.dst_port_to_sock_id:
                 self.dst_port_to_sock_id.pop(port)
-            if sock_id in self.sock_id_to_flow_id:
+            if sock_id in self.sock_id_to_flow_id.keys():
                 self.sock_id_to_flow_id.pop(sock_id)
             log.debug("remove kernel flow: {} for env {}".format(sock_id, self.env_id))
             self.kernel_flows.pop(sock_id)
@@ -220,14 +220,14 @@ class EnvFlows(object):
         self.sock_id_to_env_id = {key:val for key, val in self.sock_id_to_env_id.items() if val != env_id}
 
     def bind_port_to_env(self, port, env_id):
-        if port not in self.dst_port_to_env_id:
-            self.dst_port_to_env_id[port] = env_id
-            log.debug("bind port: {} with env: {}".format(port, env_id))
+        # if port not in self.dst_port_to_env_id:
+        self.dst_port_to_env_id[port] = env_id
+        log.info("bind port: {} with env: {}".format(port, env_id))
 
     def bind_sock_id_to_env(self, sock_id, env_id):
-        if sock_id not in self.sock_id_to_env_id:
-            self.sock_id_to_env_id[sock_id] = env_id
-            log.debug("bind kernel flow: {} with env: {}".format(sock_id, env_id))
+        # if sock_id not in self.sock_id_to_env_id:
+        self.sock_id_to_env_id[sock_id] = env_id
+        log.info("bind kernel flow: {} with env: {}".format(sock_id, env_id))
     
     def release_port_to_env(self, port):
         if port in self.dst_port_to_env_id:
