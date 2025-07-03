@@ -56,27 +56,27 @@ class ActiveFlowMap(object):
     def try_associate(self, dst_port, id, value_type):
         if value_type == ValueType.SOCK_ID:
             sock_id = id
-            print("try_associate sock id with flow id under dst_port:", dst_port)
+            # print("try_associate sock id with flow id under dst_port:", dst_port)
             if dst_port in self.dst_port_to_flow_id: # flow id already exists for port
                 # first look up flow id from send port
                 flow_id = self.dst_port_to_flow_id[dst_port]
                 self.flow_id_to_sock_id[flow_id] = sock_id
                 self.sock_id_to_flow_id[sock_id] = flow_id
-                print("associate flow id: {} with sock id: {}".format(flow_id, sock_id))
+                # print("associate flow id: {} with sock id: {}".format(flow_id, sock_id))
             else:
-                print("no flow id to associate with sock id:", dst_port, sock_id)
-                # pass
+                # print("no flow id to associate with sock id:", dst_port, sock_id)
+                pass
         elif value_type == ValueType.FLOW_ID:
             flow_id = id
-            print("try_associate flow id with sock id:", dst_port)
+            # print("try_associate flow id with sock id:", dst_port)
             if dst_port in self.dst_port_to_sock_id: # sock id already exists for port
                 sock_id = self.dst_port_to_sock_id[dst_port]
                 self.flow_id_to_sock_id[flow_id] = sock_id
                 self.sock_id_to_flow_id[sock_id] = flow_id
-                print("associate flow id: {} with sock id: {}".format(flow_id, sock_id))
+                # print("associate flow id: {} with sock id: {}".format(flow_id, sock_id))
             else:
-                print("no sock id to associate with flow id:", dst_port, flow_id)
-                # pass
+                # print("no sock id to associate with flow id:", dst_port, flow_id)
+                pass
 
     def add_flow_with_sockId(self, flow: Flow):
         # print("added flow with sockId:", flow.dst_port, flow.sock_id)

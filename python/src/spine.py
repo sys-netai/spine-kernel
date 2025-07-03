@@ -95,7 +95,7 @@ def read_netlink_message(nl_sock: Netlink):
         # print ("add flow with sock_id: ", flow.sock_id)
         # print ("add flow with flow_id: ", active_flow_map.get_flowId_by_sockId(flow.sock_id))
         # print ("add flow with dst_port: ", flow.dst_port)
-        print("After the association: ", env_id, active_flow_map.get_all_flow_ids(), active_flow_map, active_flow_map.sock_id_to_flow_id, active_flow_map.dst_port_to_sock_id)
+        # print("After the association: ", env_id, active_flow_map.get_all_flow_ids(), active_flow_map, active_flow_map.sock_id_to_flow_id, active_flow_map.dst_port_to_sock_id)
         return ReturnStatus.Continue
     elif hdr.type == NL_READY:
         log.info("Spine kernel is ready!!")
