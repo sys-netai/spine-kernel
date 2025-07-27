@@ -26,7 +26,7 @@
 #define THR_UNIT_DEEPCC (1 << THR_SCALE_DEEPCC)
 
 // The number of past monitor intervals used for decision making.
-#define PCC_INTERVALS 2
+#define PCC_INTERVALS 4
 
 #define PCC_PROBING_EPS 25
 #define PCC_PROBING_EPS_PART 1000
@@ -264,7 +264,6 @@ void policy_update_cwnd(struct policycache_data *policycache, struct sock *sk)
 	policycache->ready_cwnd = min((u32)policycache->ready_cwnd, tp->snd_cwnd_clamp);
 	// pr_info("increase_count: %d, decrease_count: %d\n", increase_count, decrease_count);
 	// pr_info("original cwnd: %llu, ready cwnd: %llu\n", policycache->cwnd, policycache->ready_cwnd);
-
 }
 
 bool policycache_valid(struct policycache_data *policycache)
