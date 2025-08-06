@@ -18,5 +18,6 @@ fi
 /sbin/insmod ./$module.ko || ((dmesg | tail) && exit 1)
 
 
-ALLOWED=$(sudo cat /proc/sys/net/ipv4/tcp_allowed_congestion_control)
-echo "${ALLOWED} ${module}" | sudo tee /proc/sys/net/ipv4/tcp_allowed_congestion_control
+ALLOWED=$(sudo cat /proc/sys/net/ipv4/tcp_available_congestion_control)
+# echo "${ALLOWED} ${module}" | sudo tee /proc/sys/net/ipv4/tcp_available_congestion_control
+sudo sysctl -w net.ipv4.tcp_allowed_congestion_control="${ALLOWED}"

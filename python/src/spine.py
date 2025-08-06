@@ -95,6 +95,7 @@ def read_netlink_message(nl_sock: Netlink):
         # print ("add flow with sock_id: ", flow.sock_id)
         # print ("add flow with flow_id: ", active_flow_map.get_flowId_by_sockId(flow.sock_id))
         # print ("add flow with dst_port: ", flow.dst_port)
+        print("After the association: ", env_id, active_flow_map.get_all_flow_ids(), active_flow_map, active_flow_map.sock_id_to_flow_id, active_flow_map.dst_port_to_sock_id)
         return ReturnStatus.Continue
     elif hdr.type == NL_READY:
         log.info("Spine kernel is ready!!")
@@ -116,8 +117,10 @@ def read_netlink_message(nl_sock: Netlink):
         active_flow_map = env_flows.get_env_flows(env_id)
         flow_id = active_flow_map.get_flowId_by_sockId(sock_id)
         # print("get a new measure from flow {}!".format(flow_id))
+        # print("get from sock_id: ", sock_id, "flow id map: ", active_flow_map.sock_id_to_flow_id, "env id: ", env_id)
         if flow_id == None:
-            print("Warning: a none flow_id")
+            print("want to get from sock_id: ", sock_id, "flow id map: ", active_flow_map, active_flow_map.sock_id_to_flow_id, "env id: ", env_id)
+            # print("Warning: a none flow_id")
             return ReturnStatus.Continue
         # msg_to_unix["flow_id"] = flow_id
         client_sock = client_from_sock[sock_id]

@@ -28,6 +28,10 @@
 #define MONITOR_INTERVAL 30000
 #define NEO_RATE_MIN 4096u
 
+// Add THR_UNIT_DEEPCC definition
+#define THR_SCALE_DEEPCC 24
+#define THR_UNIT_DEEPCC (1 << THR_SCALE_DEEPCC)
+
 extern struct spine_datapath *kernel_datapath;
 extern struct timespec64 tzero;
 static int id = 0;
@@ -49,6 +53,14 @@ struct neo_interval {
 
 	u32 lost; /* packets sent during this interval that were lost */
 	u32 delivered; /* packets sent during this interval that were delivered */
+
+
+	u32 send_id; /* id of the send interval */
+    u32 receive_id; /* id of the receive interval */
+    
+    // Add throughput tracking fields
+    u64 avg_throughput;
+    u64 thr_cnt;
 };
 
 /* TCP NEO Parameters */
@@ -93,6 +105,10 @@ struct neo_data {
 
 	/* others */
 	u32 double_counted;
+
+	// 在 neo_data 里加两个计数器
+	u32 send_id_counter; 
+    u32 receive_id_counter; 
 };
 
 /*****************
@@ -259,11 +275,15 @@ void start_interval(struct sock *sk, struct neo_data *neo)
 {
 
 	struct neo_interval *interval = &neo->intervals[neo->send_index];
+	interval->send_id = ++(neo->send_id_counter);	
 	interval->packets_ended = 0;
 	interval->lost = 0;
 	interval->delivered = 0;
 	interval->packets_sent_base = max(tcp_sk(sk)->data_segs_out, 1U);
 	interval->send_start = tcp_sk(sk)->tcp_mstamp;
+	// Initialize throughput tracking fields
+	interval->avg_throughput = 0;
+	interval->thr_cnt = 0;
 	// pr_info("Start a interval, packets_sent_base: %d, send_start:%llu\n", interval->packets_sent_base, interval->send_start);
 	// neo_calculate_and_set_rate(sk, neo, interval);
 	// neo_set_cwnd(sk);
@@ -320,22 +340,30 @@ void start_next_send_interval(struct sock *sk, struct neo_data *neo)
  * based on socket statistics.
  */
 void neo_update_interval(struct neo_interval *interval, struct neo_data *neo,
-			 struct sock *sk)
+			 struct sock *sk, const struct rate_sample *rs)
 {
 	interval->recv_end = tcp_sk(sk)->tcp_mstamp;
 	interval->end_rtt = tcp_sk(sk)->srtt_us >> 3;
 	interval->lost += tcp_sk(sk)->lost - neo->lost_base;
 	interval->delivered += tcp_sk(sk)->delivered - neo->delivered_base;
+	
+	// Add throughput calculation similar to policycache
+	if (rs->delivered < 0 || rs->interval_us <= 0)
+		return; /* Not a valid observation */
+	
+	u64 bw = (u64)rs->delivered * THR_UNIT_DEEPCC;
+	do_div(bw, rs->interval_us);
+	interval->avg_throughput += bw;
+	interval->thr_cnt++;
 }
 
 /* Updates the NEO model */
-void neo_process(struct sock *sk)
+void neo_process(struct sock *sk, const struct rate_sample *rs)
 {
 	struct neo_data *neo = inet_csk_ca(sk);
 	struct tcp_sock *tsk = tcp_sk(sk);
 	struct neo_interval *interval;
 	int index;
-	u32 before;
 
 	if (!neo_valid(neo))
 		return;
@@ -350,7 +378,6 @@ void neo_process(struct sock *sk)
 	/* update recv intervals */
 	index = neo->receive_index;
 	interval = &neo->intervals[index];
-	before = neo->packets_counted;
 	neo->packets_counted = tsk->delivered + tsk->lost -
 				neo->double_counted;
 	if (receive_interval_ended(interval, tsk, neo)) {
@@ -358,13 +385,14 @@ void neo_process(struct sock *sk)
 		// pr_info("data_segs_in: %d, data_segs_out: %d, delivered: %d, lost: %d", tsk->data_segs_in, tsk->data_segs_out, tsk->delivered, tsk->lost);
 		neo->receive_index = get_next_index(index);
 		interval = &neo->intervals[neo->receive_index];
+		interval->receive_id= ++(neo->receive_id_counter);
 		interval->recv_start = tcp_sk(sk)->tcp_mstamp;
 		interval->start_rtt = tcp_sk(sk)->srtt_us >> 3;
 		if (neo->receive_index == 0)
 			neo->first_circle = false;
 	}else{
 		// pr_info("update %d-th recv inverval. the packet count is %d, the double_counted is %d", index, neo->packets_counted, neo->double_counted);
-		neo_update_interval(interval, neo, sk);
+		neo_update_interval(interval, neo, sk, rs);
 	}
 }
 
@@ -391,7 +419,9 @@ void neo_fetch_measurements(struct spine_connection *conn,
 	get_sock_from_spine(&sk, conn);
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct neo_data *neo = inet_csk_ca(sk);
-	*num_fields = 15;
+	*num_fields = 18; // Updated from 17 to 18
+	int last_received_id = get_previous_index(neo->receive_index, 1u);
+	int last_last_received_id = get_previous_index(last_received_id, 1u);
 	if (neo->first_circle && neo->receive_index < 2) {
 		measurements[0] = 0;
 		measurements[1] = 0;
@@ -407,22 +437,31 @@ void neo_fetch_measurements(struct spine_connection *conn,
 		measurements[11] = 0;
 		measurements[12] = 0;
 		measurements[13] = 0;
+		measurements[14] = 0;
+		measurements[15] = 0;
+		measurements[16] = 0;
+		measurements[17] = 0;
+		int index;
+		struct neo_interval *interval;
+		index = neo->send_index;
+		interval = &neo->intervals[index];
+		measurements[16] = interval->send_id;
+		measurements[17] = neo->intervals[last_received_id].receive_id;
 		return;
 	}
-	int last_received_id = get_previous_index(neo->receive_index, 1u);
-	int last_last_received_id = get_previous_index(last_received_id, 1u);
+
 	// neo->last_used_cwnd = neo->intervals[last_received_id].cwnd;
 
-	//pr_info("For the last interval: rate: %llu, lost: %llu; delivered: %llu; start_Rtt:%llu, end_rtt:%llu. send_start:%llu, send_end:%llu, recv_start:%llu, recv_end:%llu ", 
-					// neo->intervals[last_received_id].rate,
-					// neo->intervals[last_received_id].lost,
-					// neo->intervals[last_received_id].delivered,
-					// neo->intervals[last_received_id].start_rtt,
-					// neo->intervals[last_received_id].end_rtt,
-					// neo->intervals[last_received_id].send_start,
-					// neo->intervals[last_received_id].send_end,
-					// neo->intervals[last_received_id].recv_start,
-					// neo->intervals[last_received_id].recv_end);
+	// pr_info("For the last interval: rate: %llu, lost: %llu; delivered: %llu; start_Rtt:%llu, end_rtt:%llu. send_start:%llu, send_end:%llu, recv_start:%llu, recv_end:%llu ", 
+	// 				neo->intervals[last_received_id].rate,
+	// 				neo->intervals[last_received_id].lost,
+	// 				neo->intervals[last_received_id].delivered,
+	// 				neo->intervals[last_received_id].start_rtt,
+	// 				neo->intervals[last_received_id].end_rtt,
+	// 				neo->intervals[last_received_id].send_start,
+	// 				neo->intervals[last_received_id].send_end,
+	// 				neo->intervals[last_received_id].recv_start,
+	// 				neo->intervals[last_received_id].recv_end);
 	measurements[0] = neo->intervals[last_received_id].delivered;
 	measurements[1] = neo->intervals[last_last_received_id].delivered;
 	measurements[2] = neo->intervals[last_received_id].lost;
@@ -451,6 +490,27 @@ void neo_fetch_measurements(struct spine_connection *conn,
 	measurements[13] = neo->intervals[last_last_received_id].cwnd;
 	// current cwnd
 	measurements[14] = neo->cwnd;
+	
+	// Convert throughput back to real value by dividing by THR_UNIT_DEEPCC
+	if (neo->intervals[last_received_id].thr_cnt > 0) {
+		u64 avg_throughput = neo->intervals[last_received_id].avg_throughput / 
+		                     neo->intervals[last_received_id].thr_cnt;
+		// 检查溢出风险
+		if (avg_throughput <= U64_MAX / (tp->mss_cache * USEC_PER_SEC / THR_UNIT_DEEPCC)) {
+			measurements[15] = avg_throughput * tp->mss_cache * USEC_PER_SEC / THR_UNIT_DEEPCC;
+		} else {
+			measurements[15] = U64_MAX; // 溢出时设置为最大值
+		}
+	} else {
+		measurements[15] = 0;
+	}
+	
+	int index;
+	struct neo_interval *interval;
+	index = neo->send_index;
+	interval = &neo->intervals[index];
+	measurements[16] = interval->send_id;
+	measurements[17] = neo->intervals[last_received_id].receive_id;
 }
 
 /**
@@ -590,6 +650,10 @@ static void neo_init(struct sock *sk)
 	ca->receive_index = 0;
 	ca->first_circle = true;
 	ca->double_counted = 0;
+
+	// 在这里加初始化
+	ca->send_id_counter = 0;
+	ca->receive_id_counter = 0;
 
 	start_interval(sk, ca);
 
@@ -736,7 +800,7 @@ static void neo_cong_control(struct sock *sk, const struct rate_sample *rs)
 		goto end;
 	}
 	// pr_info("The acked is %d, the delivered is %d, the interval_us is %d", rs->acked_sacked, rs->delivered, rs->interval_us);
-	neo_process(sk);
+	neo_process(sk, rs);
 	// printk(KERN_INFO "[NEO] Get into control1.\n");
 	// call spine to update parameters if needed
 	if (conn != NULL) {
