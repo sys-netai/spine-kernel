@@ -36,6 +36,10 @@
 
 #define PCC_LAT_INFL_FILTER 30
 
+
+/* Rates must differ by at least 2% or gradients are very noisy. */
+#define POLICYCACHE_MIN_RATE_DIFF_RATIO_FOR_GRAD 20
+
 /* ---- */
 
 enum PCC_DECISION {
@@ -111,7 +115,7 @@ struct policycache_data {
 
 
 	u16 last_learned_id;
-	u16 last_learned_direction;
+	s16 last_learned_direction;
 
 	int id;
 	/* communication */
@@ -159,19 +163,29 @@ static u32 policycache_get_rtt(struct tcp_sock *tp)
 /* Calculate the graident of utility w.r.t. sending rate, but only if the rates
  * are far enough apart for the measurment to have low noise.
  */
-static s64 pcc_calc_util_grad(s64 rate_1, s64 util_1, s64 rate_2, s64 util_2) {
-	if (rate_1 == rate_2)
+static s64 policycache_calc_util_grad(s64 rate_1, s64 util_1, s64 rate_2, s64 util_2) {
+	s64 rate_diff_ratio = (POLICYCACHE_SCALE * (rate_2 - rate_1)) / rate_1;
+	if (rate_diff_ratio < POLICYCACHE_MIN_RATE_DIFF_RATIO_FOR_GRAD && 
+		rate_diff_ratio > -1 * POLICYCACHE_MIN_RATE_DIFF_RATIO_FOR_GRAD)
 		return 0;
-	
-	s64 rate_diff = rate_2 - rate_1;
-	s64 util_diff = util_2 - util_1;
 
-	if ((rate_diff > 0 && util_diff > 0) || (rate_diff < 0 && util_diff < 0))
-		return 1;
-	else if ((rate_diff > 0 && util_diff < 0) || (rate_diff < 0 && util_diff > 0))
-		return -1;
-	return 0;
+	return (POLICYCACHE_SCALE * POLICYCACHE_SCALE * (util_2 - util_1)) / (rate_2 - rate_1);
 }
+
+
+// static s64 pcc_calc_util_grad(s64 rate_1, s64 util_1, s64 rate_2, s64 util_2) {
+// 	if (rate_1 == rate_2)
+// 		return 0;
+	
+// 	s64 rate_diff = rate_2 - rate_1;
+// 	s64 util_diff = util_2 - util_1;
+
+// 	if ((rate_diff > 0 && util_diff > 0) || (rate_diff < 0 && util_diff < 0))
+// 		return 1;
+// 	else if ((rate_diff > 0 && util_diff < 0) || (rate_diff < 0 && util_diff > 0))
+// 		return -1;
+// 	return 0;
+// }
 
 // get cwnd based on the rate
 static u64 policycache_get_cwnd(struct sock *sk, u64 rate)
@@ -195,78 +209,121 @@ void generate_recommend_action(struct policycache_data *policycache, struct sock
 	u32 last_received_id, last_last_received_id;
 	s64 grad;
 	u64 cwnd, last_cwnd;
-	s64 utility_diff;
-
+	s64 change_ratio = 0;
+	s64 avg_gradient = 0;
 
 	if (policycache->first_circle && policycache->receive_index < 2) {
-		policycache->last_learned_direction = 2;
+		policycache->last_learned_direction = 0;
 		return;
 	}
+	
 	// get the last two intervals 
 	last_received_id = policycache->receive_index;
 	last_last_received_id = get_previous_index(last_received_id, 1u);
-	cwnd = policycache->intervals[last_received_id].cwnd;	
-	last_cwnd = policycache->intervals[last_last_received_id].cwnd;
-	utility_diff = policycache->intervals[last_received_id].utility - policycache->intervals[last_last_received_id].utility;
-	policycache->last_learned_id = policycache->intervals[last_last_received_id].recv_id_when_sent;
-	if (cwnd > last_cwnd) {
-		if (utility_diff > 0) {
-			policycache->last_learned_direction = 1;
-		} else if (utility_diff < 0) {
-			policycache->last_learned_direction = 0;
+	
+	struct policycache_interval *interval1 = &policycache->intervals[last_last_received_id];
+	struct policycache_interval *interval2 = &policycache->intervals[last_received_id];
+	
+	// Calculate gradient between the two intervals
+	grad = policycache_calc_util_grad(interval1->rate, interval1->utility, 
+									 interval2->rate, interval2->utility);
+	
+	policycache->last_learned_id = interval1->recv_id_when_sent;
+	
+	if (grad != 0) {
+		// Use the gradient directly as avg_gradient since we only have one pair
+		avg_gradient = grad;
+		
+		// 1. Bound the gradient to (-POLICYCACHE_SCALE, POLICYCACHE_SCALE)
+		if (avg_gradient > POLICYCACHE_SCALE) {
+			avg_gradient = POLICYCACHE_SCALE;
+		} else if (avg_gradient < -POLICYCACHE_SCALE) {
+			avg_gradient = -POLICYCACHE_SCALE;
 		}
-	}
-	else if (cwnd < last_cwnd) {
-		if (utility_diff > 0) {
-			policycache->last_learned_direction = 0;
-		} else if (utility_diff < 0) {
-			policycache->last_learned_direction = 1;
-		}
-	}
-	else{
-		policycache->last_learned_direction = 2;
+		
+		// 2. Calculate change ratio: when grad is POLICYCACHE_SCALE, we get maximum change
+		// Maximum change ratio is PCC_PROBING_EPS / PCC_PROBING_EPS_PART
+		change_ratio = (avg_gradient * PCC_PROBING_EPS) / (PCC_PROBING_EPS_PART);
+		
+		// 3. Set last_learned_direction to the change ratio
+		policycache->last_learned_direction = (s16) (change_ratio + PCC_PROBING_EPS_PART);
+	} else {
+		// No valid gradient, set to 0 (no change)
+		policycache->last_learned_direction = 0;
 	}
 }
+
 
 // update the ready_cwnd according to previous probing intervals.
 void policy_update_cwnd(struct policycache_data *policycache, struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	u32 probe_start_index = policycache->probe_start_index;
-	u64 increase_count = 0, decrease_count = 0;
+	s64 gradient_sum = 0;
+	u32 valid_pairs = 0;
+	s64 change_ratio = 0;
+	s64 grad = 0;
+	s64 avg_gradient = 0;
 
+	// Calculate gradients for all interval pairs and sum them up
 	for (int i = probe_start_index; i < policycache->receive_index; i+=2) {
-		if (policycache->intervals[i].cwnd > policycache->intervals[i+1].cwnd) {
-			if (policycache->intervals[i].utility > policycache->intervals[i+1].utility) {
-				increase_count++;
-			} else {
-				decrease_count++;
-			}
+		if (i+1 >= policycache->receive_index) {
+			break; // Ensure we have a complete pair
 		}
-		else if (policycache->intervals[i].cwnd < policycache->intervals[i+1].cwnd) {
-			if (policycache->intervals[i].utility < policycache->intervals[i+1].utility) {
-				increase_count++;
-			} else {
-				decrease_count++;
-			}
+		
+		struct policycache_interval *interval1 = &policycache->intervals[i];
+		struct policycache_interval *interval2 = &policycache->intervals[i+1];
+		
+		// Calculate gradient between the two intervals
+		grad = policycache_calc_util_grad(interval1->rate, interval1->utility, 
+											 interval2->rate, interval2->utility);
+		
+		if (grad != 0) { // Only consider valid gradients
+			gradient_sum += grad;
+			valid_pairs++;
 		}
 	}
 	
 	policycache->last_learned_id = policycache->intervals[probe_start_index].recv_id_when_sent;
-	if (increase_count > decrease_count) {
-		policycache->ready_cwnd = policycache->cwnd * (PCC_PROBING_EPS_PART + PCC_PROBING_EPS) / PCC_PROBING_EPS_PART + 1;
-		policycache->last_learned_direction = 1;
-	} else if (increase_count < decrease_count) {
-		policycache->ready_cwnd = policycache->cwnd * PCC_PROBING_EPS_PART / (PCC_PROBING_EPS_PART + PCC_PROBING_EPS) - 1;
+	
+	if (valid_pairs > 0) {
+		// Calculate average gradient
+		avg_gradient = gradient_sum / valid_pairs;
+		
+		// 1. Bound the average gradient to (-POLICYCACHE_SCALE, POLICYCACHE_SCALE)
+		if (avg_gradient > POLICYCACHE_SCALE) {
+			avg_gradient = POLICYCACHE_SCALE;
+		} else if (avg_gradient < -POLICYCACHE_SCALE) {
+			avg_gradient = -POLICYCACHE_SCALE;
+		}
+		
+		// 2. Calculate change ratio: when grad is POLICYCACHE_SCALE, we get maximum change
+		// Maximum change ratio is PCC_PROBING_EPS / PCC_PROBING_EPS_PART
+		change_ratio = (avg_gradient * PCC_PROBING_EPS) / (PCC_PROBING_EPS_PART);
+		
+		// 3. Set last_learned_direction to the change ratio
+		policycache->last_learned_direction = (s16) (change_ratio + PCC_PROBING_EPS_PART);
+		
+		// Apply the change ratio to cwnd
+		if (change_ratio > 0) {
+			// Increase cwnd
+			policycache->ready_cwnd = policycache->cwnd * (change_ratio + PCC_PROBING_EPS_PART) / PCC_PROBING_EPS_PART + 1;
+		} else if (change_ratio < 0) {
+			// Decrease cwnd
+			policycache->ready_cwnd = policycache->cwnd * (change_ratio + PCC_PROBING_EPS_PART) / PCC_PROBING_EPS_PART - 1;
+		} else {
+			// No change
+			policycache->ready_cwnd = policycache->cwnd;
+		}
+	} else {
+		// No valid gradients, keep current cwnd
+		policycache->ready_cwnd = policycache->cwnd;
 		policycache->last_learned_direction = 0;
 	}
-	else {
-		policycache->ready_cwnd = policycache->cwnd;
-		policycache->last_learned_direction = 2;
-	}
+	
 	policycache->ready_cwnd = max(policycache->ready_cwnd, 4ULL);
 	policycache->ready_cwnd = min((u32)policycache->ready_cwnd, tp->snd_cwnd_clamp);
-	// pr_info("increase_count: %d, decrease_count: %d\n", increase_count, decrease_count);
+	pr_info("avg_gradient: %lld, change_ratio: %lld, last_learned_direction: %d\n", avg_gradient, change_ratio, policycache->last_learned_direction);
 	// pr_info("original cwnd: %llu, ready cwnd: %llu\n", policycache->cwnd, policycache->ready_cwnd);
 }
 
@@ -292,9 +349,6 @@ void start_interval(struct sock *sk, struct policycache_data *policycache)
 	interval->thr_cnt = 0;
 	interval->recv_id_when_sent = get_previous_index(policycache->receive_index, 1u);
 	interval->first_send_interval = false;
-
-
-
 
 	interval->decision = PCC_CWND_STAY;
 
@@ -665,7 +719,7 @@ void policycache_fetch_measurements(struct spine_connection *conn,
 	measurements[16] = last_received_id;
 	measurements[17] = policycache->last_learned_id;
 	measurements[18] = policycache->last_learned_direction;
-	policycache->last_learned_direction = 3; // 3 means invalid, so the userspace won't use duplicate samples
+	policycache->last_learned_direction = 0; // 0 means invalid, so the userspace won't use duplicate samples
 }
 
 /**
@@ -764,7 +818,7 @@ static void policycache_init(struct sock *sk)
 	ca->first_circle = true;
 	ca->double_counted = 0;
 	ca->last_learned_id = 0;
-	ca->last_learned_direction = 3;
+	ca->last_learned_direction = 0;
 
 	start_interval(sk, ca);
 
