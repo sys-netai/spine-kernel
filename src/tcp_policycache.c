@@ -164,12 +164,13 @@ static u32 policycache_get_rtt(struct tcp_sock *tp)
  * are far enough apart for the measurment to have low noise.
  */
 static s64 policycache_calc_util_grad(s64 rate_1, s64 util_1, s64 rate_2, s64 util_2) {
+	// pr_info("rate_1: %lld, util_1: %lld, rate_2: %lld, util_2: %lld\n", rate_1, util_1, rate_2, util_2);
 	s64 rate_diff_ratio = (POLICYCACHE_SCALE * (rate_2 - rate_1)) / rate_1;
 	if (rate_diff_ratio < POLICYCACHE_MIN_RATE_DIFF_RATIO_FOR_GRAD && 
 		rate_diff_ratio > -1 * POLICYCACHE_MIN_RATE_DIFF_RATIO_FOR_GRAD)
 		return 0;
 
-	return (POLICYCACHE_SCALE * POLICYCACHE_SCALE * (util_2 - util_1)) / (rate_2 - rate_1);
+	return (POLICYCACHE_SCALE * (util_2 - util_1)) / (rate_2 - rate_1);
 }
 
 
@@ -227,7 +228,8 @@ void generate_recommend_action(struct policycache_data *policycache, struct sock
 	// Calculate gradient between the two intervals
 	grad = policycache_calc_util_grad(interval1->rate, interval1->utility, 
 									 interval2->rate, interval2->utility);
-	
+	pr_info("grad: %lld, rate1: %llu, util1: %lld, rate2: %llu, util2: %lld\n", 
+			grad, interval1->rate, interval1->utility, interval2->rate, interval2->utility);
 	policycache->last_learned_id = interval1->recv_id_when_sent;
 	
 	if (grad != 0) {
@@ -289,6 +291,7 @@ void policy_update_cwnd(struct policycache_data *policycache, struct sock *sk)
 	if (valid_pairs > 0) {
 		// Calculate average gradient
 		avg_gradient = gradient_sum / valid_pairs;
+		pr_info("valid_pairs: %d, gradient_sum: %lld, avg_gradient: %lld\n", valid_pairs, gradient_sum, avg_gradient);
 		
 		// 1. Bound the average gradient to (-POLICYCACHE_SCALE, POLICYCACHE_SCALE)
 		if (avg_gradient > POLICYCACHE_SCALE) {
@@ -551,6 +554,12 @@ s64 loss_ratio, delivered, lost, mss, rate, throughput, util;
 		//  policycache->id, rate, interval->packets_ended - interval->packets_sent_base,
 		//  delivered, lost, interval->start_rtt / USEC_PER_MSEC, interval->end_rtt / USEC_PER_MSEC, util, rate, throughput);
 	interval->utility = util;
+	if(util != rate)
+		pr_info("policycache %d: rate %llu, sent %u, delv %lld, lost %lld, lat (%lld->%lld), lat_diff %lld, util %lld, rate %llu, thpt %llu\n",
+				policycache->id, rate, interval->packets_ended - interval->packets_sent_base,
+				delivered, lost, interval->start_rtt / USEC_PER_MSEC,
+				interval->end_rtt / USEC_PER_MSEC,  rtt_diff,
+				util, rate, throughput);
 }
 
 s64 get_gap_between_two_intervals(u32 id, u32 another_id) {
