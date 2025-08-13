@@ -36,6 +36,8 @@
 
 #define PCC_LAT_INFL_FILTER 30
 
+#define GRAD_TO_RATE_CHANGE_FACTOR 1000
+
 
 /* Rates must differ by at least 2% or gradients are very noisy. */
 #define POLICYCACHE_MIN_RATE_DIFF_RATIO_FOR_GRAD 20
@@ -83,10 +85,8 @@ struct policycache_interval {
 
 /* TCP POLICYCACHE Parameters */
 struct policycache_data {
-	int cnt; /*  cwnd change */
 	bool in_recovery;
 	bool is_probe;
-	u32 r_cwnd; /* cwnd in loss or recovery */
 
 	u8 slow_start_passed;
 
@@ -100,6 +100,7 @@ struct policycache_data {
 	u64 ready_cwnd; // cwnd updated by RL model, used in the next MI
 
 	u64 cwnd;
+	u64 rate; /* current sending rate */
 
 	u32 lost_base; /* previously lost packets */
 	u32 delivered_base; /* previously delivered packets */
@@ -210,7 +211,7 @@ void generate_recommend_action(struct policycache_data *policycache, struct sock
 	u32 last_received_id, last_last_received_id;
 	s64 grad;
 	u64 cwnd, last_cwnd;
-	s64 change_ratio = 0;
+	s64 change_rate = 0;
 	s64 avg_gradient = 0;
 
 	if (policycache->first_circle && policycache->receive_index < 2) {
@@ -228,30 +229,33 @@ void generate_recommend_action(struct policycache_data *policycache, struct sock
 	// Calculate gradient between the two intervals
 	grad = policycache_calc_util_grad(interval1->rate, interval1->utility, 
 									 interval2->rate, interval2->utility);
-	pr_info("grad: %lld, rate1: %llu, util1: %lld, rate2: %llu, util2: %lld\n", 
-			grad, interval1->rate, interval1->utility, interval2->rate, interval2->utility);
-	policycache->last_learned_id = interval1->recv_id_when_sent;
+
+	// pr_info("RECOMMEND: grad: %lld, rate1: %llu, util1: %lld, rate2: %llu, util2: %lld\n", 
+	// 		grad, interval1->rate, interval1->utility, interval2->rate, interval2->utility);
+	// policycache->last_learned_id = interval1->recv_id_when_sent;
 	
 	if (grad != 0) {
 		// Use the gradient directly as avg_gradient since we only have one pair
 		avg_gradient = grad;
 		
-		// 1. Bound the gradient to (-POLICYCACHE_SCALE, POLICYCACHE_SCALE)
-		if (avg_gradient > POLICYCACHE_SCALE) {
-			avg_gradient = POLICYCACHE_SCALE;
-		} else if (avg_gradient < -POLICYCACHE_SCALE) {
-			avg_gradient = -POLICYCACHE_SCALE;
+		change_rate = GRAD_TO_RATE_CHANGE_FACTOR * avg_gradient * 1000000 / POLICYCACHE_SCALE / 8; // From Mbps to Bps
+
+		//multiplicative change_rate = change rate / recent interval->rate
+		change_rate = (change_rate * POLICYCACHE_SCALE) / (s64) (policycache->rate) + PCC_PROBING_EPS_PART;
+		
+		// Bound the average gradient to [(-PCC_PROBING_EPS) * rate / PCC_PROBING_EPS_PART, (PCC_PROBING_EPS) * rate / PCC_PROBING_EPS_PART]
+		if (change_rate > (s64)(PCC_PROBING_EPS + PCC_PROBING_EPS_PART)) {
+			change_rate = (s64)(PCC_PROBING_EPS + PCC_PROBING_EPS_PART);
+		} else if (change_rate < (s64)(PCC_PROBING_EPS_PART - PCC_PROBING_EPS)) {
+			change_rate = (s64)(PCC_PROBING_EPS_PART - PCC_PROBING_EPS);
 		}
-		
-		// 2. Calculate change ratio: when grad is POLICYCACHE_SCALE, we get maximum change
-		// Maximum change ratio is PCC_PROBING_EPS / PCC_PROBING_EPS_PART
-		change_ratio = (avg_gradient * PCC_PROBING_EPS) / (PCC_PROBING_EPS_PART);
-		
+
 		// 3. Set last_learned_direction to the change ratio
-		policycache->last_learned_direction = (s16) (change_ratio + PCC_PROBING_EPS_PART);
+		policycache->last_learned_direction = (s16) (change_rate);
+	pr_info("RECOMMEND: avg_gradient: %lld, change_rate: %lld, last_learned_direction: %d\n", avg_gradient, change_rate, policycache->last_learned_direction);
 	} else {
 		// No valid gradient, set to 0 (no change)
-		policycache->last_learned_direction = 0;
+		policycache->last_learned_direction = 1000;
 	}
 }
 
@@ -262,8 +266,8 @@ void policy_update_cwnd(struct policycache_data *policycache, struct sock *sk)
 	struct tcp_sock *tp = tcp_sk(sk);
 	u32 probe_start_index = policycache->probe_start_index;
 	s64 gradient_sum = 0;
-	u32 valid_pairs = 0;
-	s64 change_ratio = 0;
+	s32 valid_pairs = 0;
+	s64 change_rate = 0;
 	s64 grad = 0;
 	s64 avg_gradient = 0;
 
@@ -280,6 +284,8 @@ void policy_update_cwnd(struct policycache_data *policycache, struct sock *sk)
 		grad = policycache_calc_util_grad(interval1->rate, interval1->utility, 
 											 interval2->rate, interval2->utility);
 		
+		// pr_info("grad: %lld, rate1: %llu, util1: %lld, rate2: %llu, util2: %lld\n",
+				// grad, interval1->rate, interval1->utility, interval2->rate, interval2->utility);
 		if (grad != 0) { // Only consider valid gradients
 			gradient_sum += grad;
 			valid_pairs++;
@@ -291,43 +297,47 @@ void policy_update_cwnd(struct policycache_data *policycache, struct sock *sk)
 	if (valid_pairs > 0) {
 		// Calculate average gradient
 		avg_gradient = gradient_sum / valid_pairs;
-		pr_info("valid_pairs: %d, gradient_sum: %lld, avg_gradient: %lld\n", valid_pairs, gradient_sum, avg_gradient);
-		
-		// 1. Bound the average gradient to (-POLICYCACHE_SCALE, POLICYCACHE_SCALE)
-		if (avg_gradient > POLICYCACHE_SCALE) {
-			avg_gradient = POLICYCACHE_SCALE;
-		} else if (avg_gradient < -POLICYCACHE_SCALE) {
-			avg_gradient = -POLICYCACHE_SCALE;
+
+		// Convert the average gradient to a change rate
+		change_rate = GRAD_TO_RATE_CHANGE_FACTOR * avg_gradient * 1000000 / POLICYCACHE_SCALE / POLICYCACHE_SCALE / 8; // From Mbps to Bps
+
+		// Multiplicative change_rate = change rate / recent interval->rate
+		change_rate = (change_rate * POLICYCACHE_SCALE) / (s64) (policycache->rate) + PCC_PROBING_EPS_PART;
+
+		pr_info("original change_rate: %lld, avg_gradient: %lld, valid_pairs: %u\n",
+			 change_rate, avg_gradient, valid_pairs);
+		// Bound the average gradient to [(-PCC_PROBING_EPS) * rate / PCC_PROBING_EPS_PART, (PCC_PROBING_EPS) * rate / PCC_PROBING_EPS_PART]
+		if (change_rate > (s64)(PCC_PROBING_EPS + PCC_PROBING_EPS_PART)) {
+			change_rate = (s64)(PCC_PROBING_EPS + PCC_PROBING_EPS_PART);
+		} else if (change_rate < (s64)(PCC_PROBING_EPS_PART - PCC_PROBING_EPS)) {
+			change_rate = (s64)(PCC_PROBING_EPS_PART - PCC_PROBING_EPS);
 		}
+
 		
-		// 2. Calculate change ratio: when grad is POLICYCACHE_SCALE, we get maximum change
-		// Maximum change ratio is PCC_PROBING_EPS / PCC_PROBING_EPS_PART
-		change_ratio = (avg_gradient * PCC_PROBING_EPS) / (PCC_PROBING_EPS_PART);
-		
-		// 3. Set last_learned_direction to the change ratio
-		policycache->last_learned_direction = (s16) (change_ratio + PCC_PROBING_EPS_PART);
-		
+		// Set last_learned_direction to the change ratio
+		policycache->last_learned_direction = (s16) (change_rate);
+
 		// Apply the change ratio to cwnd
-		if (change_ratio > 0) {
+		if (policycache->last_learned_direction > 1000) {
 			// Increase cwnd
-			policycache->ready_cwnd = policycache->cwnd * (change_ratio + PCC_PROBING_EPS_PART) / PCC_PROBING_EPS_PART + 1;
-		} else if (change_ratio < 0) {
+			policycache->ready_cwnd = policycache->cwnd * policycache->last_learned_direction / PCC_PROBING_EPS_PART + 1;
+		} else if (policycache->last_learned_direction < 1000) {
 			// Decrease cwnd
-			policycache->ready_cwnd = policycache->cwnd * (change_ratio + PCC_PROBING_EPS_PART) / PCC_PROBING_EPS_PART - 1;
+			policycache->ready_cwnd = policycache->cwnd * policycache->last_learned_direction / PCC_PROBING_EPS_PART - 1;
 		} else {
 			// No change
 			policycache->ready_cwnd = policycache->cwnd;
-		}
+		} 
 	} else {
 		// No valid gradients, keep current cwnd
 		policycache->ready_cwnd = policycache->cwnd;
-		policycache->last_learned_direction = 0;
+		policycache->last_learned_direction = 1000;
 	}
 	
 	policycache->ready_cwnd = max(policycache->ready_cwnd, 4ULL);
 	policycache->ready_cwnd = min((u32)policycache->ready_cwnd, tp->snd_cwnd_clamp);
-	pr_info("avg_gradient: %lld, change_ratio: %lld, last_learned_direction: %d\n", avg_gradient, change_ratio, policycache->last_learned_direction);
-	// pr_info("original cwnd: %llu, ready cwnd: %llu\n", policycache->cwnd, policycache->ready_cwnd);
+	pr_info("avg_gradient: %lld, change_rate: %lld, last_learned_direction: %d\n", avg_gradient, change_rate, policycache->last_learned_direction);
+	pr_info("original cwnd: %llu, ready cwnd: %llu\n", policycache->cwnd, policycache->ready_cwnd);
 }
 
 bool policycache_valid(struct policycache_data *policycache)
@@ -429,6 +439,7 @@ void start_interval(struct sock *sk, struct policycache_data *policycache)
 	new_rate = max(new_rate, POLICYCACHE_RATE_MIN);
 	new_rate = min(new_rate, sk->sk_max_pacing_rate);
 	interval->rate = new_rate;
+	policycache->rate = new_rate;
 	sk->sk_pacing_rate = new_rate;
 
 	// pr_info("Start a interval, cwnd: %llu, rate: %llu\n", new_cwnd, new_rate);
@@ -554,12 +565,12 @@ s64 loss_ratio, delivered, lost, mss, rate, throughput, util;
 		//  policycache->id, rate, interval->packets_ended - interval->packets_sent_base,
 		//  delivered, lost, interval->start_rtt / USEC_PER_MSEC, interval->end_rtt / USEC_PER_MSEC, util, rate, throughput);
 	interval->utility = util;
-	if(util != rate)
-		pr_info("policycache %d: rate %llu, sent %u, delv %lld, lost %lld, lat (%lld->%lld), lat_diff %lld, util %lld, rate %llu, thpt %llu\n",
-				policycache->id, rate, interval->packets_ended - interval->packets_sent_base,
-				delivered, lost, interval->start_rtt / USEC_PER_MSEC,
-				interval->end_rtt / USEC_PER_MSEC,  rtt_diff,
-				util, rate, throughput);
+	// if(util != rate)
+	// 	pr_info("policycache %d: rate %llu, sent %u, delv %lld, lost %lld, lat (%lld->%lld), lat_diff %lld, util %lld, rate %llu, thpt %llu\n",
+	// 			policycache->id, rate, interval->packets_ended - interval->packets_sent_base,
+	// 			delivered, lost, interval->start_rtt / USEC_PER_MSEC,
+	// 			interval->end_rtt / USEC_PER_MSEC,  rtt_diff,
+	// 			util, rate, throughput);
 }
 
 s64 get_gap_between_two_intervals(u32 id, u32 another_id) {
@@ -792,11 +803,9 @@ static void policycache_release(struct sock *sk)
 
 static inline void policycache_reset(struct policycache_data *ca)
 {
-	ca->cnt = 0;
 	ca->prev_ca_state = TCP_CA_Open;
 	ca->in_recovery = false;
 	ca->prior_cwnd = 0;
-	ca->r_cwnd = 0;
 	ca->slow_start_passed = 0;
 }
 
@@ -817,6 +826,7 @@ static void policycache_init(struct sock *sk)
 	ca->id = id;
 	tp->snd_cwnd = 64;//64; // init value
 	ca->cwnd = tp->snd_cwnd;
+	ca->rate = 1024 * POLICYCACHE_RATE_MIN;
 	ca->ready_cwnd = tp->snd_cwnd;
 	ca->is_probe = true;
 
@@ -922,27 +932,27 @@ static u32 policycache_undo_cwnd(struct sock *sk)
 	return tcp_sk(sk)->snd_cwnd;
 }
 
-static void slow_set_cwnd(struct sock *sk, u32 acked)
-{
-	// do_div(change, POLICYCACHE_SCALE);
-	struct tcp_sock *tp = tcp_sk(sk);
-	struct policycache_data *ca = inet_csk_ca(sk);
-	u32 cwnd = tp->snd_cwnd;
-	int delta = ca->cnt;
-	// printk(KERN_INFO "Delta before division: %d.\n", delta);
+// static void slow_set_cwnd(struct sock *sk, u32 acked)
+// {
+// 	// do_div(change, POLICYCACHE_SCALE);
+// 	struct tcp_sock *tp = tcp_sk(sk);
+// 	struct policycache_data *ca = inet_csk_ca(sk);
+// 	u32 cwnd = tp->snd_cwnd;
+// 	int delta = ca->cnt;
+// 	// printk(KERN_INFO "Delta before division: %d.\n", delta);
 
-	delta = delta / POLICYCACHE_SCALE;
+// 	delta = delta / POLICYCACHE_SCALE;
 
-	if (delta != 0) {
-		ca->cnt -= delta * POLICYCACHE_SCALE;
-		// printk(KERN_INFO "[POLICYCACHE] Old CWND %d, New CWND %d.\n", cwnd, cwnd + delta);
-		cwnd += delta;
-	}
-	cwnd = max(4ULL, cwnd);
-	cwnd = min((u32)cwnd, tp->snd_cwnd_clamp); /* apply cap */
-	tp->snd_cwnd = cwnd;
+// 	if (delta != 0) {
+// 		ca->cnt -= delta * POLICYCACHE_SCALE;
+// 		// printk(KERN_INFO "[POLICYCACHE] Old CWND %d, New CWND %d.\n", cwnd, cwnd + delta);
+// 		cwnd += delta;
+// 	}
+// 	cwnd = max(4ULL, cwnd);
+// 	cwnd = min((u32)cwnd, tp->snd_cwnd_clamp); /* apply cap */
+// 	tp->snd_cwnd = cwnd;
 
-}
+// }
 
 // u32 policycache_slow_start(struct sock *sk, u32 acked)
 // {
