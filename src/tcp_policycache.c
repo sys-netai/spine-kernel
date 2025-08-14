@@ -25,8 +25,8 @@
 #define THR_SCALE_DEEPCC 24
 #define THR_UNIT_DEEPCC (1 << THR_SCALE_DEEPCC)
 
-// The number of past monitor intervals used for decision making.
-#define PCC_INTERVALS 4
+// The number of past monitor intervals used for decision making (probing)
+#define PCC_PROBING_INTERVALS 4
 
 #define PCC_PROBING_EPS 25
 #define PCC_PROBING_EPS_PART 1000
@@ -35,12 +35,6 @@
 #define PCC_MAX_SWING_BUFFER 2
 
 #define PCC_LAT_INFL_FILTER 30
-
-#define GRAD_TO_RATE_CHANGE_FACTOR 1000
-
-
-/* Rates must differ by at least 2% or gradients are very noisy. */
-#define POLICYCACHE_MIN_RATE_DIFF_RATIO_FOR_GRAD 20
 
 /* ---- */
 
@@ -79,12 +73,16 @@ struct policycache_interval {
 
 	u64 avg_throughput;
 	u64 thr_cnt;
+
+	bool first_send_interval; 
 };
 
 /* TCP POLICYCACHE Parameters */
 struct policycache_data {
+	int cnt; /*  cwnd change */
 	bool in_recovery;
 	bool is_probe;
+	u32 r_cwnd; /* cwnd in loss or recovery */
 
 	u8 slow_start_passed;
 
@@ -98,7 +96,6 @@ struct policycache_data {
 	u64 ready_cwnd; // cwnd updated by RL model, used in the next MI
 
 	u64 cwnd;
-	u64 rate; /* current sending rate */
 
 	u32 lost_base; /* previously lost packets */
 	u32 delivered_base; /* previously delivered packets */
@@ -114,7 +111,7 @@ struct policycache_data {
 
 
 	u16 last_learned_id;
-	s16 last_learned_direction;
+	u16 last_learned_direction;
 
 	int id;
 	/* communication */
@@ -162,30 +159,19 @@ static u32 policycache_get_rtt(struct tcp_sock *tp)
 /* Calculate the graident of utility w.r.t. sending rate, but only if the rates
  * are far enough apart for the measurment to have low noise.
  */
-static s64 policycache_calc_util_grad(s64 rate_1, s64 util_1, s64 rate_2, s64 util_2) {
-	// pr_info("rate_1: %lld, util_1: %lld, rate_2: %lld, util_2: %lld\n", rate_1, util_1, rate_2, util_2);
-	s64 rate_diff_ratio = (POLICYCACHE_SCALE * (rate_2 - rate_1)) / rate_1;
-	if (rate_diff_ratio < POLICYCACHE_MIN_RATE_DIFF_RATIO_FOR_GRAD && 
-		rate_diff_ratio > -1 * POLICYCACHE_MIN_RATE_DIFF_RATIO_FOR_GRAD)
+static s64 pcc_calc_util_grad(s64 rate_1, s64 util_1, s64 rate_2, s64 util_2) {
+	if (rate_1 == rate_2)
 		return 0;
-
-	return (POLICYCACHE_SCALE * (util_2 - util_1)) / (rate_2 - rate_1);
-}
-
-
-// static s64 pcc_calc_util_grad(s64 rate_1, s64 util_1, s64 rate_2, s64 util_2) {
-// 	if (rate_1 == rate_2)
-// 		return 0;
 	
-// 	s64 rate_diff = rate_2 - rate_1;
-// 	s64 util_diff = util_2 - util_1;
+	s64 rate_diff = rate_2 - rate_1;
+	s64 util_diff = util_2 - util_1;
 
-// 	if ((rate_diff > 0 && util_diff > 0) || (rate_diff < 0 && util_diff < 0))
-// 		return 1;
-// 	else if ((rate_diff > 0 && util_diff < 0) || (rate_diff < 0 && util_diff > 0))
-// 		return -1;
-// 	return 0;
-// }
+	if ((rate_diff > 0 && util_diff > 0) || (rate_diff < 0 && util_diff < 0))
+		return 1;
+	else if ((rate_diff > 0 && util_diff < 0) || (rate_diff < 0 && util_diff > 0))
+		return -1;
+	return 0;
+}
 
 // get cwnd based on the rate
 static u64 policycache_get_cwnd(struct sock *sk, u64 rate)
@@ -209,117 +195,79 @@ void generate_recommend_action(struct policycache_data *policycache, struct sock
 	u32 last_received_id, last_last_received_id;
 	s64 grad;
 	u64 cwnd, last_cwnd;
+	s64 utility_diff;
+
 
 	if (policycache->first_circle && policycache->receive_index < 2) {
-		policycache->last_learned_direction = 0;
+		policycache->last_learned_direction = 2;
 		return;
 	}
-	
 	// get the last two intervals 
 	last_received_id = policycache->receive_index;
 	last_last_received_id = get_previous_index(last_received_id, 1u);
 	cwnd = policycache->intervals[last_received_id].cwnd;	
 	last_cwnd = policycache->intervals[last_last_received_id].cwnd;
-	if (cwnd == last_cwnd){
-		grad = 0;
-	}else{
-		grad = pcc_calc_util_grad(
-			policycache->intervals[last_received_id].cwnd,
-			policycache->intervals[last_received_id].utility,
-			policycache->intervals[last_last_received_id].cwnd,
-			policycache->intervals[last_last_received_id].utility);
+	utility_diff = policycache->intervals[last_received_id].utility - policycache->intervals[last_last_received_id].utility;
+	policycache->last_learned_id = policycache->intervals[last_last_received_id].recv_id_when_sent;
+	if (cwnd > last_cwnd) {
+		if (utility_diff > 0) {
+			policycache->last_learned_direction = 1;
+		} else if (utility_diff < 0) {
+			policycache->last_learned_direction = 0;
+		}
 	}
-	if (grad > 0){
-		policycache->last_learned_id = policycache->intervals[last_last_received_id].recv_id_when_sent;
-		policycache->last_learned_direction = 1;
-	}else if (grad < 0){
-		policycache->last_learned_id = policycache->intervals[last_last_received_id].recv_id_when_sent;
-		policycache->last_learned_direction = 0;
-	}else{
-		policycache->last_learned_id = policycache->intervals[last_last_received_id].recv_id_when_sent;
+	else if (cwnd < last_cwnd) {
+		if (utility_diff > 0) {
+			policycache->last_learned_direction = 0;
+		} else if (utility_diff < 0) {
+			policycache->last_learned_direction = 1;
+		}
+	}
+	else{
 		policycache->last_learned_direction = 2;
 	}
 }
-
 
 // update the ready_cwnd according to previous probing intervals.
 void policy_update_cwnd(struct policycache_data *policycache, struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	u32 probe_start_index = policycache->probe_start_index;
-	s64 gradient_sum = 0;
-	s32 valid_pairs = 0;
-	s64 change_rate = 0;
-	s64 grad = 0;
-	s64 avg_gradient = 0;
+	u64 increase_count = 0, decrease_count = 0;
 
-	// Calculate gradients for all interval pairs and sum them up
 	for (int i = probe_start_index; i < policycache->receive_index; i+=2) {
-		if (i+1 >= policycache->receive_index) {
-			break; // Ensure we have a complete pair
+		if (policycache->intervals[i].cwnd > policycache->intervals[i+1].cwnd) {
+			if (policycache->intervals[i].utility > policycache->intervals[i+1].utility) {
+				increase_count++;
+			} else {
+				decrease_count++;
+			}
 		}
-		
-		struct policycache_interval *interval1 = &policycache->intervals[i];
-		struct policycache_interval *interval2 = &policycache->intervals[i+1];
-		
-		// Calculate gradient between the two intervals
-		grad = policycache_calc_util_grad(interval1->rate, interval1->utility, 
-											 interval2->rate, interval2->utility);
-		
-		// pr_info("grad: %lld, rate1: %llu, util1: %lld, rate2: %llu, util2: %lld\n",
-				// grad, interval1->rate, interval1->utility, interval2->rate, interval2->utility);
-		if (grad != 0) { // Only consider valid gradients
-			gradient_sum += grad;
-			valid_pairs++;
+		else if (policycache->intervals[i].cwnd < policycache->intervals[i+1].cwnd) {
+			if (policycache->intervals[i].utility < policycache->intervals[i+1].utility) {
+				increase_count++;
+			} else {
+				decrease_count++;
+			}
 		}
 	}
 	
 	policycache->last_learned_id = policycache->intervals[probe_start_index].recv_id_when_sent;
-	
-	if (valid_pairs > 0) {
-		// Calculate average gradient
-		avg_gradient = gradient_sum / valid_pairs;
-
-		// Convert the average gradient to a change rate
-		change_rate = GRAD_TO_RATE_CHANGE_FACTOR * avg_gradient * 1000000 / POLICYCACHE_SCALE / POLICYCACHE_SCALE / 8; // From Mbps to Bps
-
-		// Multiplicative change_rate = change rate / recent interval->rate
-		change_rate = (change_rate * POLICYCACHE_SCALE) / (s64) (policycache->rate) + PCC_PROBING_EPS_PART;
-
-		pr_info("original change_rate: %lld, avg_gradient: %lld, valid_pairs: %u\n",
-			 change_rate, avg_gradient, valid_pairs);
-		// Bound the average gradient to [(-PCC_PROBING_EPS) * rate / PCC_PROBING_EPS_PART, (PCC_PROBING_EPS) * rate / PCC_PROBING_EPS_PART]
-		if (change_rate > (s64)(PCC_PROBING_EPS + PCC_PROBING_EPS_PART)) {
-			change_rate = (s64)(PCC_PROBING_EPS + PCC_PROBING_EPS_PART);
-		} else if (change_rate < (s64)(PCC_PROBING_EPS_PART - PCC_PROBING_EPS)) {
-			change_rate = (s64)(PCC_PROBING_EPS_PART - PCC_PROBING_EPS);
-		}
-
-		
-		// Set last_learned_direction to the change ratio
-		policycache->last_learned_direction = (s16) (change_rate);
-
-		// Apply the change ratio to cwnd
-		if (policycache->last_learned_direction > 1000) {
-			// Increase cwnd
-			policycache->ready_cwnd = policycache->cwnd * policycache->last_learned_direction / PCC_PROBING_EPS_PART + 1;
-		} else if (policycache->last_learned_direction < 1000) {
-			// Decrease cwnd
-			policycache->ready_cwnd = policycache->cwnd * policycache->last_learned_direction / PCC_PROBING_EPS_PART - 1;
-		} else {
-			// No change
-			policycache->ready_cwnd = policycache->cwnd;
-		} 
-	} else {
-		// No valid gradients, keep current cwnd
-		policycache->ready_cwnd = policycache->cwnd;
-		policycache->last_learned_direction = 1000;
+	if (increase_count > decrease_count) {
+		policycache->ready_cwnd = policycache->cwnd * (PCC_PROBING_EPS_PART + PCC_PROBING_EPS) / PCC_PROBING_EPS_PART + 1;
+		policycache->last_learned_direction = 1;
+	} else if (increase_count < decrease_count) {
+		policycache->ready_cwnd = policycache->cwnd * PCC_PROBING_EPS_PART / (PCC_PROBING_EPS_PART + PCC_PROBING_EPS) - 1;
+		policycache->last_learned_direction = 0;
 	}
-	
+	else {
+		policycache->ready_cwnd = policycache->cwnd;
+		policycache->last_learned_direction = 2;
+	}
 	policycache->ready_cwnd = max(policycache->ready_cwnd, 4ULL);
 	policycache->ready_cwnd = min((u32)policycache->ready_cwnd, tp->snd_cwnd_clamp);
-	pr_info("avg_gradient: %lld, change_rate: %lld, last_learned_direction: %d\n", avg_gradient, change_rate, policycache->last_learned_direction);
-	pr_info("original cwnd: %llu, ready cwnd: %llu\n", policycache->cwnd, policycache->ready_cwnd);
+	// pr_info("increase_count: %d, decrease_count: %d\n", increase_count, decrease_count);
+	// pr_info("original cwnd: %llu, ready cwnd: %llu\n", policycache->cwnd, policycache->ready_cwnd);
 }
 
 bool policycache_valid(struct policycache_data *policycache)
@@ -345,21 +293,19 @@ void start_interval(struct sock *sk, struct policycache_data *policycache)
 	interval->recv_id_when_sent = get_previous_index(policycache->receive_index, 1u);
 	interval->first_send_interval = false;
 
+
+
+
 	interval->decision = PCC_CWND_STAY;
 
 	// if probing, add random to the cwnd
 	if (policycache->is_probe) {
 
-	new_cwnd = policycache->ready_cwnd;
-	// Set cwnd from ready_cwnd (cwnd-first)
-	new_cwnd = max(4ULL, new_cwnd);
-	new_cwnd = min((u32)new_cwnd, tp->snd_cwnd_clamp); /* apply cap */
-	policycache->cwnd = new_cwnd;
-	policycache->ready_cwnd = new_cwnd;
+		new_cwnd = policycache->ready_cwnd;
+		// Set cwnd from ready_cwnd (cwnd-first)
+		policycache->cwnd = new_cwnd;
+		policycache->ready_cwnd = new_cwnd;
 
-	interval->decision = PCC_CWND_STAY;
-	// if probing, add random to the cwnd
-	if (policycache->is_probe) {
 		if ((policycache->send_index - policycache->probe_start_index) % 2 == 0) {
 			get_random_bytes(&rand, 1);
 			if (rand & 1) {
@@ -379,9 +325,39 @@ void start_interval(struct sock *sk, struct policycache_data *policycache)
 				interval->decision = PCC_CWND_UP;
 			}
 		}
-		new_cwnd = max(4ULL, new_cwnd);
-		new_cwnd = min((u32)new_cwnd, tp->snd_cwnd_clamp);
 	}
+	else{
+		u32 last_interval_index = get_previous_index(policycache->send_index, 1u);
+		if (policycache->intervals[last_interval_index].first_send_interval) {
+			new_cwnd = policycache->cwnd; // use the cwnd of the last interval
+			// similar with probe, use another direction
+			if (policycache->intervals[last_interval_index].decision == PCC_CWND_UP) {
+				new_cwnd = new_cwnd * PCC_PROBING_EPS_PART / (PCC_PROBING_EPS_PART + PCC_PROBING_EPS) - 1;
+				interval->decision = PCC_CWND_DOWN;
+			} else {
+				new_cwnd = new_cwnd * (PCC_PROBING_EPS_PART + PCC_PROBING_EPS) / PCC_PROBING_EPS_PART + 1;
+				interval->decision = PCC_CWND_UP;
+			}
+			interval->first_send_interval = false;
+		}
+		else{
+			new_cwnd = policycache->ready_cwnd;
+			policycache->ready_cwnd = new_cwnd;
+			policycache->cwnd = new_cwnd;
+			get_random_bytes(&rand, 1);
+			if (rand & 1) {
+				new_cwnd = new_cwnd * (PCC_PROBING_EPS_PART + PCC_PROBING_EPS) / PCC_PROBING_EPS_PART + 1;
+				interval->decision = PCC_CWND_UP;
+			} else {
+				new_cwnd = new_cwnd * PCC_PROBING_EPS_PART / (PCC_PROBING_EPS_PART + PCC_PROBING_EPS) - 1;
+				interval->decision = PCC_CWND_DOWN;
+			}
+
+			interval->first_send_interval = true;
+		}
+	}
+	new_cwnd = max(4ULL, new_cwnd);
+	new_cwnd = min((u32)new_cwnd, tp->snd_cwnd_clamp);
 
 	interval->cwnd = new_cwnd;
 	tp->snd_cwnd = new_cwnd;
@@ -396,7 +372,6 @@ void start_interval(struct sock *sk, struct policycache_data *policycache)
 	new_rate = max(new_rate, POLICYCACHE_RATE_MIN);
 	new_rate = min(new_rate, sk->sk_max_pacing_rate);
 	interval->rate = new_rate;
-	policycache->rate = new_rate;
 	sk->sk_pacing_rate = new_rate;
 
 	// pr_info("Start a interval, cwnd: %llu, rate: %llu\n", new_cwnd, new_rate);
@@ -522,12 +497,6 @@ s64 loss_ratio, delivered, lost, mss, rate, throughput, util;
 		//  policycache->id, rate, interval->packets_ended - interval->packets_sent_base,
 		//  delivered, lost, interval->start_rtt / USEC_PER_MSEC, interval->end_rtt / USEC_PER_MSEC, util, rate, throughput);
 	interval->utility = util;
-	// if(util != rate)
-	// 	pr_info("policycache %d: rate %llu, sent %u, delv %lld, lost %lld, lat (%lld->%lld), lat_diff %lld, util %lld, rate %llu, thpt %llu\n",
-	// 			policycache->id, rate, interval->packets_ended - interval->packets_sent_base,
-	// 			delivered, lost, interval->start_rtt / USEC_PER_MSEC,
-	// 			interval->end_rtt / USEC_PER_MSEC,  rtt_diff,
-	// 			util, rate, throughput);
 }
 
 s64 get_gap_between_two_intervals(u32 id, u32 another_id) {
@@ -575,15 +544,17 @@ void policycache_process(struct sock *sk, const struct rate_sample *rs)
 		// pr_info("data_segs_in: %d, data_segs_out: %d, delivered: %d, lost: %d", tsk->data_segs_in, tsk->data_segs_out, tsk->delivered, tsk->lost);
 		pcc_calc_utility_vivace_latency(policycache, interval, sk);
 		if (policycache->is_probe) {
-			// If the number of intervals is greater than or equal to PCC_INTERVALS, change the rate and reset the probe state.
+			// If the number of intervals is greater than or equal to PCC_PROBING_INTERVALS, change the rate and reset the probe state.
 			// pr_info("probe_start_index: %d, receive_index: %d\n", policycache->probe_start_index, policycache->receive_index);
-			if (get_gap_between_two_intervals((u32)policycache->probe_start_index, (u32)policycache->receive_index) + 1 >= PCC_INTERVALS) {
+			if (get_gap_between_two_intervals((u32)policycache->probe_start_index, (u32)policycache->receive_index) + 1 >= PCC_PROBING_INTERVALS) {
 				policy_update_cwnd(policycache, sk);
 				policycache->probe_start_index = get_next_index(policycache->send_index);
 				// pr_info("updated: probe_start_index: %d, receive_index: %d\n", policycache->probe_start_index, policycache->receive_index);
 			}
 		}else{
-			// generate_recommend_action(policycache, sk);
+			if (!policycache->intervals[(u32)policycache->receive_index].first_send_interval) { // send loop finished, generate a learning sample 
+				generate_recommend_action(policycache, sk);
+			}
 		}
 
 		// update the receive index
@@ -694,7 +665,7 @@ void policycache_fetch_measurements(struct spine_connection *conn,
 	measurements[16] = last_received_id;
 	measurements[17] = policycache->last_learned_id;
 	measurements[18] = policycache->last_learned_direction;
-	policycache->last_learned_direction = 0; // 0 means invalid, so the userspace won't use duplicate samples
+	policycache->last_learned_direction = 3; // 3 means invalid, so the userspace won't use duplicate samples
 }
 
 /**
@@ -758,9 +729,11 @@ static void policycache_release(struct sock *sk)
 
 static inline void policycache_reset(struct policycache_data *ca)
 {
+	ca->cnt = 0;
 	ca->prev_ca_state = TCP_CA_Open;
 	ca->in_recovery = false;
 	ca->prior_cwnd = 0;
+	ca->r_cwnd = 0;
 	ca->slow_start_passed = 0;
 }
 
@@ -781,7 +754,6 @@ static void policycache_init(struct sock *sk)
 	ca->id = id;
 	tp->snd_cwnd = 64;//64; // init value
 	ca->cwnd = tp->snd_cwnd;
-	ca->rate = 1024 * POLICYCACHE_RATE_MIN;
 	ca->ready_cwnd = tp->snd_cwnd;
 	ca->is_probe = true;
 
@@ -792,7 +764,7 @@ static void policycache_init(struct sock *sk)
 	ca->first_circle = true;
 	ca->double_counted = 0;
 	ca->last_learned_id = 0;
-	ca->last_learned_direction = 0;
+	ca->last_learned_direction = 3;
 
 	start_interval(sk, ca);
 
@@ -887,27 +859,27 @@ static u32 policycache_undo_cwnd(struct sock *sk)
 	return tcp_sk(sk)->snd_cwnd;
 }
 
-// static void slow_set_cwnd(struct sock *sk, u32 acked)
-// {
-// 	// do_div(change, POLICYCACHE_SCALE);
-// 	struct tcp_sock *tp = tcp_sk(sk);
-// 	struct policycache_data *ca = inet_csk_ca(sk);
-// 	u32 cwnd = tp->snd_cwnd;
-// 	int delta = ca->cnt;
-// 	// printk(KERN_INFO "Delta before division: %d.\n", delta);
+static void slow_set_cwnd(struct sock *sk, u32 acked)
+{
+	// do_div(change, POLICYCACHE_SCALE);
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct policycache_data *ca = inet_csk_ca(sk);
+	u32 cwnd = tp->snd_cwnd;
+	int delta = ca->cnt;
+	// printk(KERN_INFO "Delta before division: %d.\n", delta);
 
-// 	delta = delta / POLICYCACHE_SCALE;
+	delta = delta / POLICYCACHE_SCALE;
 
-// 	if (delta != 0) {
-// 		ca->cnt -= delta * POLICYCACHE_SCALE;
-// 		// printk(KERN_INFO "[POLICYCACHE] Old CWND %d, New CWND %d.\n", cwnd, cwnd + delta);
-// 		cwnd += delta;
-// 	}
-// 	cwnd = max(4ULL, cwnd);
-// 	cwnd = min((u32)cwnd, tp->snd_cwnd_clamp); /* apply cap */
-// 	tp->snd_cwnd = cwnd;
+	if (delta != 0) {
+		ca->cnt -= delta * POLICYCACHE_SCALE;
+		// printk(KERN_INFO "[POLICYCACHE] Old CWND %d, New CWND %d.\n", cwnd, cwnd + delta);
+		cwnd += delta;
+	}
+	cwnd = max(4ULL, cwnd);
+	cwnd = min((u32)cwnd, tp->snd_cwnd_clamp); /* apply cap */
+	tp->snd_cwnd = cwnd;
 
-// }
+}
 
 // u32 policycache_slow_start(struct sock *sk, u32 acked)
 // {
