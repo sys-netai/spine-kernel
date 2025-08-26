@@ -103,7 +103,22 @@ class DoubleTree:
         # 在线 Hoeffding 树预测
         a_ot = self.online_tree.predict(x)
         return a_dt, a_ot
-    
+        
+    def predict_prob(self, state):
+        """
+        :param state: 一维特征向量，长度 = n_features_
+        :return: (a_dt, a_vfdt)，都是 int
+        """
+        # 确保是 numpy 二维数组，shape=(1, n_features)
+        x = np.array(state, dtype=np.float32).reshape(1, -1)
+        if self.dt is None:
+            a_dt = None
+        else:
+            a_dt = self.dt.predict_proba(x)
+        # 在线 Hoeffding 树预测
+        a_ot = self.online_tree.predict_proba(x)
+        return a_dt, a_ot
+
     def update_ot(self, state, label):
         """
         用一个最新 (state, label) 样本增量训练 VFDT
