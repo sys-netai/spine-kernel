@@ -6,6 +6,10 @@ import numpy as np
 # 假设你有一个 DoubleTree 类
 from policycache import DoubleTree, TreeType
 
+# delete the current model decision_tree_online.pkl
+if os.path.exists("decision_tree_online.pkl"):
+    os.remove("decision_tree_online.pkl")
+ 
 # 初始化 double tree
 double_tree = DoubleTree(dt_path="decision_tree_online.pkl",
                          online_tree_type=TreeType.HAT,
@@ -59,12 +63,12 @@ while True:
                         "dt_action_prob": dt_action_prob[0].tolist(),
                         "vfdt_action_prob": vfdt_action_prob[0].tolist()
                 }
-                print("inference: state:", state, "reply:", reply)
+                # print("inference: state:", state, "reply:", reply)
                 client.write(json.dumps(reply))
             elif req_type == "update":
                 state = data["state"]
                 action = data["action"]
-                #print("update: state:", state, "action:", action)
+                print("update: state:", state, "action:", action)
                 if(action == 0 or action == 1):
                     double_tree.update_ot(state, action)
                 client.write(json.dumps({"status": "updated"}))

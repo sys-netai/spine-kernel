@@ -449,7 +449,7 @@ void policycache_update_interval(struct policycache_interval *interval, struct p
 
 static void pcc_calc_utility_vivace_latency(struct policycache_data *policycache,
 	struct policycache_interval *interval, struct sock *sk) {
-s64 loss_ratio, delivered, lost, mss, rate, throughput, util;
+	s64 loss_ratio, delivered, lost, mss, rate, throughput, util;
 	s64 lat_infl = 0;
     s64 rtt_diff;
     s64 rtt_diff_thresh = 0;
@@ -491,11 +491,20 @@ s64 loss_ratio, delivered, lost, mss, rate, throughput, util;
 	loss_ratio = (lost * POLICYCACHE_SCALE) / (lost + delivered);
 
 	util = /* int_sqrt((u64)rate)*/ rate - (rate * (900 * lat_infl + 11 * loss_ratio)) / POLICYCACHE_SCALE;
-
-	// printk(KERN_INFO
-	// 	"%d ucalc: rate %lld sent %u delv %lld lost %lld lat (%lld->%lld) util %lld rate %lld thpt %lld\n",
-		//  policycache->id, rate, interval->packets_ended - interval->packets_sent_base,
-		//  delivered, lost, interval->start_rtt / USEC_PER_MSEC, interval->end_rtt / USEC_PER_MSEC, util, rate, throughput);
+	// used to test whether a concave utility is necessary.
+	// if (lat_infl == 0){
+	// 	util = rate;
+	// }else if (lat_infl > 0){
+	// 	util = - 1000000000 - lat_infl;
+	// }else{
+	// 	util = 1000000000 + (-lat_infl);
+	// }
+	
+	// throughput - 900 * lat_infl - 11 * loss_ratio;
+	printk(KERN_INFO
+		"%d ucalc: rate %lld sent %u delv %lld lost %lld lat (%lld->%lld) util %lld rate %lld thpt %lld\n",
+		 policycache->id, rate, interval->packets_ended - interval->packets_sent_base,
+		 delivered, lost, interval->start_rtt / USEC_PER_MSEC, interval->end_rtt / USEC_PER_MSEC, util, rate, throughput);
 	interval->utility = util;
 }
 
@@ -828,7 +837,6 @@ static void policycache_set_state(struct sock *sk, u8 new_state)
 {	
 	struct policycache_data *policycache = inet_csk_ca(sk);
 	struct tcp_sock *tsk = tcp_sk(sk);
-
 	s32 double_counted;
 
 	if (!policycache_valid(policycache))
