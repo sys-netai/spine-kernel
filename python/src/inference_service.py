@@ -8,7 +8,7 @@ from policycache import DoubleTree, TreeType
 
 # 初始化 double tree
 double_tree = DoubleTree(dt_path="decision_tree_online.pkl",
-                         online_tree_type=TreeType.VFDT,
+                         online_tree_type=TreeType.HAT,
                          n_classes=[0, 1])
 
 IPC_PATH = "/tmp/inference_service_ipc"
@@ -36,7 +36,6 @@ while True:
                 break
             data = json.loads(msg)
             req_type = data.get("type", "inference")
-            # print("req_type:", req_type)
             if req_type == "inference":
                 state = data["state"]
                 dt_action, vfdt_action = double_tree.predict(state)
@@ -47,23 +46,15 @@ while True:
                     dt_action_prob = np.array([[0.5, 0.5]])
                 if vfdt_action_prob is None :
                     vfdt_action_prob = np.array([[0.5, 0.5]])
-                
                 if len(vfdt_action_prob[0]) < 2 or sum(vfdt_action_prob[0]) < 0.99:
                     vfdt_action_prob = np.array([[0.5, 0.5]])
                 if len(dt_action_prob[0]) < 2 or sum(dt_action_prob[0]) < 0.99:
                     dt_action_prob = np.array([[0.5, 0.5]])
-                
-                
                 dt_action = np.random.choice(np.arange(len(dt_action_prob[0])), p=dt_action_prob[0])
                 vfdt_action = np.random.choice(np.arange(len(vfdt_action_prob[0])), p=vfdt_action_prob[0])
-            
-                print("dt_action:", dt_action)
-                print("vfdt_action:", vfdt_action)
-                print("dt_action_prob:", dt_action_prob)
-                print("vfdt_action_prob:", vfdt_action_prob)
-                
+                #TODO:状态动作对齐，这里需要修改
                 reply = {
-                         "dt_action": int(dt_action),
+                        "dt_action": int(dt_action),
                         "vfdt_action": int(vfdt_action),
                         "dt_action_prob": dt_action_prob[0].tolist(),
                         "vfdt_action_prob": vfdt_action_prob[0].tolist()
