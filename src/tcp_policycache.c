@@ -28,7 +28,7 @@
 // The number of past monitor intervals used for decision making (probing)
 #define PCC_PROBING_INTERVALS 4
 
-#define PCC_PROBING_EPS 25
+#define PCC_PROBING_EPS 50
 #define PCC_PROBING_EPS_PART 1000
 
 #define PCC_GRAD_STEP_SIZE 25
@@ -293,9 +293,6 @@ void start_interval(struct sock *sk, struct policycache_data *policycache)
 	interval->recv_id_when_sent = get_previous_index(policycache->receive_index, 1u);
 	interval->first_send_interval = false;
 
-
-
-
 	interval->decision = PCC_CWND_STAY;
 
 	// if probing, add random to the cwnd
@@ -524,6 +521,53 @@ s64 get_gap_between_two_intervals(u32 id, u32 another_id) {
 }
 
 
+static void policycache_decide_slow_start(struct sock *sk, struct policycache_data *policycache)
+{
+	struct policycache_interval *previous_interval = &policycache->intervals[get_previous_index(policycache->receive_index, 1u)];
+	struct policycache_interval *interval = &policycache->intervals[policycache->receive_index];
+	s64 utility, prev_utility, adjust_utility, prev_adjust_utility, tmp_cwnd;
+	u64 rate, prev_rate;
+	s64 factor;
+	u32 extra_cwnd;
+
+	prev_utility = previous_interval->utility;
+	utility = interval->utility;
+	rate = interval->rate;
+	prev_rate = previous_interval->rate;
+
+	if (utility == 0 || prev_utility == 0 || rate == 0 || prev_rate == 0)
+		return;
+	/* The new utility should be at least 75% of the expected utility given
+	 * a significant increase. If the utility isn't as high as expected, then
+	 * we end slow start.
+	 */
+	adjust_utility = utility * (utility > 0 ? 1000 : 750) / (s64) rate;
+	prev_adjust_utility = prev_utility * (prev_utility > 0 ? 750 : 1000) / (s64) prev_rate;
+
+	printk(KERN_INFO "%d: start mode:rate %llu u %lld prev_rate %llu u %lld\n",
+		policycache->id, interval->rate, utility, previous_interval->rate, prev_utility);
+
+	printk(KERN_INFO "%d: start mode: cwnd before change %d\n, delivered: %d", policycache->id, policycache->ready_cwnd, interval->delivered);
+	// factor = min(POLICYCACHE_SCALE * MONITOR_INTERVAL / policycache_get_rtt(tcp_sk(sk)), POLICYCACHE_SCALE);
+	// get delivered packets during this interval
+	
+	// policycache->ready_cwnd += interval->delivered  * factor / 2 / POLICYCACHE_SCALE + 1;
+	policycache->ready_cwnd += interval->delivered / 10 + 1;
+	printk(KERN_INFO "%d: start mode: cwnd after change %d\n", policycache->id, policycache->ready_cwnd);
+
+	// if (utility > prev_utility) {
+	// 	 // 0.5 * MI / RTT
+	// 	printk(KERN_INFO "%d: start mode: cwnd before change %d\n", policycache->id, policycache->ready_cwnd);
+	// 	// max(MONITOR_INTERVAL / policycache_get_rtt(tcp_sk(sk));, 1);
+	// 	factor = min(POLICYCACHE_SCALE * MONITOR_INTERVAL / policycache_get_rtt(tcp_sk(sk)), POLICYCACHE_SCALE);
+	// 	policycache->ready_cwnd += policycache->ready_cwnd  * factor / 2 / POLICYCACHE_SCALE + 1;
+	// 	printk(KERN_INFO "%d: start mode: cwnd after change %d\n", policycache->id, policycache->ready_cwnd);
+	// } else {
+	// 	policycache->slow_start_passed = 1;
+	// 	printk(KERN_INFO "%d: start mode ended\n", policycache->id);
+	// }
+}
+
 /* Updates the POLICYCACHE model */
 void policycache_process(struct sock *sk, const struct rate_sample *rs)
 {
@@ -556,6 +600,11 @@ void policycache_process(struct sock *sk, const struct rate_sample *rs)
 		// pr_info("recving inverval ended packet sent base: %d, packets_ended: %d, packets_counted: %d, double_counted: %d", interval->packets_sent_base, interval->packets_ended, policycache->packets_counted, policycache->double_counted);
 		// pr_info("data_segs_in: %d, data_segs_out: %d, delivered: %d, lost: %d", tsk->data_segs_in, tsk->data_segs_out, tsk->delivered, tsk->lost);
 		pcc_calc_utility_vivace_latency(policycache, interval, sk);
+		// update cwnd
+		//if(policycache->slow_start_passed == 0 && ~(policycache->first_circle && policycache->receive_index < 2)){
+		// if(policycache->slow_start_passed == 0){
+		// 	policycache_decide_slow_start(sk, policycache);
+		// }
 		if (policycache->is_probe) {
 			// If the number of intervals is greater than or equal to PCC_PROBING_INTERVALS, change the rate and reset the probe state.
 			// pr_info("probe_start_index: %d, receive_index: %d\n", policycache->probe_start_index, policycache->receive_index);
@@ -706,7 +755,10 @@ void policycache_set_params(struct spine_connection *conn, u64 *params, u8 num_f
 	// printk(KERN_INFO "The cwnd is %llu\n", ca->cwnd);
 	// printk(KERN_INFO "The params[0] is %llu\n", params[0]);
 
+	// pr_info(" The old ready_cwnd is %llu\n", ca->ready_cwnd);
 	// 0 is for probe 
+	// if (ca->slow_start_passed == 0)
+	// 	return;
 	if (params[0] == 0) {
 		if (!ca->is_probe) {
 			ca->probe_start_index = get_next_index(ca->send_index); //reset the probe start index
@@ -721,6 +773,7 @@ void policycache_set_params(struct spine_connection *conn, u64 *params, u8 num_f
 		} else {
 			ca->ready_cwnd = ca->cwnd;
 		}
+		// pr_info("The new ready_cwnd is %llu\n", ca->ready_cwnd);
 	}
 
 	// pr_info("The ready_cwnd is %llu\n", ca->ready_cwnd);
@@ -821,9 +874,11 @@ static u32 policycache_ssthresh(struct sock *sk)
 	struct policycache_data *ca = inet_csk_ca(sk);
 	u64 cwnd;
 	struct policycache_interval *interval;
-	// if (!ca->slow_start_passed){
-	//  	ca->slow_start_passed = 1;
-	// }
+	if (!ca->slow_start_passed){
+	 	ca->slow_start_passed = 1;
+	}
+	// pr_info("The ssthresh called, cwnd: %d\n", tp->snd_cwnd);
+	// ca->ready_cwnd = ca->cwnd * 717 / 1000;
 	// 	tp->snd_cwnd = tp->snd_cwnd * 717 / 1000;
 	// 	interval = &ca->intervals[ca->send_index];
 	// 	policycache_update_pacing_rate(sk, interval);
@@ -834,7 +889,7 @@ static u32 policycache_ssthresh(struct sock *sk)
 	// 	ca->cwnd = cwnd;
 	// }
 	ca->prior_cwnd = tp->snd_cwnd;
-	return max(tp->snd_cwnd, 32U);
+	return TCP_INFINITE_SSTHRESH; // max(tp->snd_cwnd, 32U);
 }
 
 static void policycache_set_state(struct sock *sk, u8 new_state)
@@ -908,6 +963,8 @@ static void slow_set_cwnd(struct sock *sk, u32 acked)
 // 	ca->rate = rate;
 // }
 
+
+
 static void policycache_cong_control(struct sock *sk, const struct rate_sample *rs)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -924,10 +981,10 @@ static void policycache_cong_control(struct sock *sk, const struct rate_sample *
 	// 	goto end;
 	// }
 
-	if (prev_state >= TCP_CA_Recovery && state < TCP_CA_Recovery) {
-		/* Exiting loss recovery; restore cwnd saved before recovery. */
-		tp->snd_cwnd = max(tp->snd_cwnd, ca->prior_cwnd);
-	}
+	// if (prev_state >= TCP_CA_Recovery && state < TCP_CA_Recovery) {
+	// 	/* Exiting loss recovery; restore cwnd saved before recovery. */
+	// 	tp->snd_cwnd = max(tp->snd_cwnd, ca->prior_cwnd);
+	// }
 
 	if (rs->delivered < 0 || rs->interval_us < 0) {
 		goto end;
