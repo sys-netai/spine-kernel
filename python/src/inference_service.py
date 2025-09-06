@@ -1,10 +1,17 @@
 import os
 import json
 from ipc_socket import IPCSocket
+import threading
 import numpy as np
 
 # 假设你有一个 DoubleTree 类
 from policycache import DoubleTree, TreeType
+from poller import Action, Poller, ReturnStatus, PollEvents
+
+# cont status of polling
+cont = threading.Event()
+poller = Poller()
+
 
 # delete the current model decision_tree_online.pkl
 if os.path.exists("decision_tree_online.pkl"):

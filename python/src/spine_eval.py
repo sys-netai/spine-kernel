@@ -6,7 +6,6 @@ import json
 import time
 import argparse
 import threading
-import functools
 from functools import partial
 
 

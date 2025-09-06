@@ -28,7 +28,7 @@
 // The number of past monitor intervals used for decision making (probing)
 #define PCC_PROBING_INTERVALS 4
 
-#define PCC_PROBING_EPS 50
+#define PCC_PROBING_EPS 25
 #define PCC_PROBING_EPS_PART 1000
 
 #define PCC_GRAD_STEP_SIZE 25
