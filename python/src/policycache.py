@@ -128,8 +128,8 @@ class DoubleTree:
         self.online_tree.partial_fit(x, label, classes=self.n_classes)
         # Increment the learned_samples counter
         self.learned_samples += 1
-        if self.learned_samples % 500 == 0:
-            self.save_online_tree_snapshot()
+        # if self.learned_samples % 500 == 0:
+        #     self.save_online_tree_snapshot()
         # print("learned samples number: ", self.learned_samples)
 
     def print_episode_samples(self):
@@ -148,6 +148,8 @@ class DoubleTree:
         episode = self.episode_count // 3
         self.last_printed_samples = current_samples
         print(f"Online tree learned samples: {current_samples} (updated), episode: {episode}")
+        print(self.online_tree.get_model_description())
+        print(self.online_tree.get_model_measurements())
 
     def save_online_tree_snapshot(self):
         """
@@ -265,11 +267,11 @@ class DoubleTree:
             )
         elif self.online_tree_type == TreeType.HAT:
             self.online_tree = HoeffdingAdaptiveTreeClassifier(
-            grace_period=300,           # 每个节点见到多少样本后才考虑分裂
+            grace_period=50,           # 每个节点见到多少样本后才考虑分裂
             split_confidence=1e-7,     # 分裂置信度，越小越容易分裂
-            tie_threshold=0.025,        # 多特征差异<此阈值时视作平局，延迟分裂
+            tie_threshold=0.1,        # 特征分裂的平局阈值
             leaf_prediction='nba',     # 叶子预测方式：'nba' = Naive Bayes Adaptive
-            nb_threshold=100,           # 叶节点样本数≥此值才启用 NB，<则多数类
+            nb_threshold=50,           # 叶节点样本数≥此值才启用 NB，<则多数类
             binary_split=True          # 二分裂（True）或多分裂（False）
             )   
         elif self.online_tree_type == TreeType.DNN:

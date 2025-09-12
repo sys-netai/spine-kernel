@@ -26,7 +26,7 @@
 #define THR_UNIT_DEEPCC (1 << THR_SCALE_DEEPCC)
 
 // The number of past monitor intervals used for decision making (probing)
-#define PCC_PROBING_INTERVALS 4
+#define PCC_PROBING_INTERVALS 2
 
 #define PCC_PROBING_EPS 25
 #define PCC_PROBING_EPS_PART 1000
@@ -74,7 +74,7 @@ struct policycache_interval {
 	u64 avg_throughput;
 	u64 thr_cnt;
 
-	bool first_send_interval; 
+	u8 send_explore_index; 
 };
 
 /* TCP POLICYCACHE Parameters */
@@ -252,17 +252,17 @@ void policy_update_cwnd(struct policycache_data *policycache, struct sock *sk)
 		}
 	}
 	
-	policycache->last_learned_id = policycache->intervals[probe_start_index].recv_id_when_sent;
+	// policycache->last_learned_id = policycache->intervals[probe_start_index].recv_id_when_sent;
 	if (increase_count > decrease_count) {
 		policycache->ready_cwnd = policycache->cwnd * (PCC_PROBING_EPS_PART + PCC_PROBING_EPS) / PCC_PROBING_EPS_PART + 1;
-		policycache->last_learned_direction = 1;
+		// policycache->last_learned_direction = 1;
 	} else if (increase_count < decrease_count) {
 		policycache->ready_cwnd = policycache->cwnd * (PCC_PROBING_EPS_PART - PCC_PROBING_EPS) / PCC_PROBING_EPS_PART - 1;
-		policycache->last_learned_direction = 0;
+		// policycache->last_learned_direction = 0;
 	}
 	else {
 		policycache->ready_cwnd = policycache->cwnd;
-		policycache->last_learned_direction = 2;
+		// policycache->last_learned_direction = 2;
 	}
 	policycache->ready_cwnd = max(policycache->ready_cwnd, 4ULL);
 	policycache->ready_cwnd = min((u32)policycache->ready_cwnd, tp->snd_cwnd_clamp);
@@ -291,7 +291,7 @@ void start_interval(struct sock *sk, struct policycache_data *policycache)
 	interval->avg_throughput = 0;
 	interval->thr_cnt = 0;
 	interval->recv_id_when_sent = get_previous_index(policycache->receive_index, 1u);
-	interval->first_send_interval = false;
+	interval->send_explore_index = 0;
 
 	interval->decision = PCC_CWND_STAY;
 
@@ -312,6 +312,7 @@ void start_interval(struct sock *sk, struct policycache_data *policycache)
 				new_cwnd = new_cwnd * (PCC_PROBING_EPS_PART - PCC_PROBING_EPS) / PCC_PROBING_EPS_PART - 1;
 				interval->decision = PCC_CWND_DOWN;
 			}
+			interval->send_explore_index = 1;
 		}
 		else {// use the inverse direction of the previous interval
 			if (policycache->intervals[get_previous_index(policycache->send_index, 1u)].decision == PCC_CWND_UP) {
@@ -321,11 +322,12 @@ void start_interval(struct sock *sk, struct policycache_data *policycache)
 				new_cwnd = new_cwnd * (PCC_PROBING_EPS_PART + PCC_PROBING_EPS) / PCC_PROBING_EPS_PART + 1;
 				interval->decision = PCC_CWND_UP;
 			}
+			interval->send_explore_index = 2;
 		}
 	}
 	else{
 		u32 last_interval_index = get_previous_index(policycache->send_index, 1u);
-		if (policycache->intervals[last_interval_index].first_send_interval) {
+		if (policycache->intervals[last_interval_index].send_explore_index == 1) {
 			new_cwnd = policycache->cwnd; // use the cwnd of the last interval
 			// similar with probe, use another direction
 			if (policycache->intervals[last_interval_index].decision == PCC_CWND_UP) {
@@ -335,7 +337,7 @@ void start_interval(struct sock *sk, struct policycache_data *policycache)
 				new_cwnd = new_cwnd * (PCC_PROBING_EPS_PART + PCC_PROBING_EPS) / PCC_PROBING_EPS_PART + 1;
 				interval->decision = PCC_CWND_UP;
 			}
-			interval->first_send_interval = false;
+			interval->send_explore_index = 2;
 		}
 		else{
 			new_cwnd = policycache->ready_cwnd;
@@ -350,7 +352,7 @@ void start_interval(struct sock *sk, struct policycache_data *policycache)
 				interval->decision = PCC_CWND_DOWN;
 			}
 
-			interval->first_send_interval = true;
+			interval->send_explore_index = 1;
 		}
 	}
 	new_cwnd = max(4ULL, new_cwnd);
@@ -491,7 +493,7 @@ static void pcc_calc_utility_vivace_latency(struct policycache_data *policycache
 	/* loss rate = lost packets / all packets counted*/
 	loss_ratio = (lost * POLICYCACHE_SCALE) / (lost + delivered);
 
-	util = /* int_sqrt((u64)rate)*/ rate - (rate * (900 * lat_infl + 11 * loss_ratio)) / POLICYCACHE_SCALE;
+	util = /* int_sqrt((u64)rate)*/ rate - (rate * (VIVACE_LATENCY_COEFFICIENT * lat_infl + VIVACE_LOSS_COEFFICIENT * loss_ratio)) / POLICYCACHE_SCALE;
 	// used to test whether a concave utility is necessary.
 	// if (lat_infl == 0){
 	// 	util = rate;
@@ -613,10 +615,11 @@ void policycache_process(struct sock *sk, const struct rate_sample *rs)
 				policycache->probe_start_index = get_next_index(policycache->send_index);
 				// pr_info("updated: probe_start_index: %d, receive_index: %d\n", policycache->probe_start_index, policycache->receive_index);
 			}
-		}else{
-			if (!policycache->intervals[(u32)policycache->receive_index].first_send_interval) { // send loop finished, generate a learning sample 
-				generate_recommend_action(policycache, sk);
-			}
+		}
+
+		// seperate cwnd update with training sample generation
+		if (policycache->intervals[(u32)policycache->receive_index].send_explore_index == 2){
+			generate_recommend_action(policycache, sk);
 		}
 
 		// update the receive index
