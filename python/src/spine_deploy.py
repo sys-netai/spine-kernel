@@ -6,6 +6,9 @@ import json
 import time
 import argparse
 import threading
+import ipaddress
+import struct
+import select
 from functools import partial
 import context
 import numpy as np
@@ -16,12 +19,14 @@ from collections import OrderedDict
 from logger import logger as log
 from message import *
 from netlink import Netlink
+from ipc_socket import IPCSocket
 from spine_flow import Flow, ActiveFlowMap, EnvFlows
 from poller import Action, Poller, ReturnStatus, PollEvents
 from helper import drop_privileges
 import msg_sender
 
 # import from main repo
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../../src')))
 from agent.policycache import DoubleTree, TreeType
 from agent.definitions import transform_state, map_action, Direction, get_last_received_id, get_last_learned_id, get_last_learned_direction, update_score, ACTION_DIM, STATE_DIM
 
@@ -47,7 +52,7 @@ STATE_BUFFER_SIZE = 50
 INITIAL_SCORE = 1
 STACK_LENGTH = 3
 DEFAULT_PROB = [0, 1]
-PROBE_THRESHOLD = 0.65
+PROBE_THRESHOLD = 0.7
 SLOW_START_THRESHOLD = 0.65
 
 
@@ -89,6 +94,94 @@ def build_netlink_sock():
     sock.add_mc_group()
     return sock
 
+class TimerSocket(IPCSocket):
+    """A socket-like object for timer events using pipes"""
+    def __init__(self, fd):
+        # Don't call parent __init__ to avoid creating a Unix socket
+        self.__fd = fd
+        self.connected = True
+        
+    def fileno(self):
+        return self.__fd
+        
+    def read(self, size):
+        return os.read(self.__fd, size)
+        
+    def close(self):
+        if hasattr(self, '__fd') and self.__fd is not None:
+            os.close(self.__fd)
+            self.__fd = None
+            self.connected = False
+
+def create_timer_pipe():
+    """Create a pipe for timer events"""
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(read_fd, False)  # Make non-blocking
+    return read_fd, write_fd
+
+def start_timer_thread(write_fd, interval_sec):
+    """Start a background thread to write to pipe at intervals"""
+    def timer_worker():
+        while not cont.is_set():
+            time.sleep(interval_sec)
+            if not cont.is_set():
+                try:
+                    os.write(write_fd, b'tick')
+                except OSError:
+                    break
+        try:
+            os.close(write_fd)
+        except OSError:
+            pass
+    
+    thread = threading.Thread(target=timer_worker, daemon=True)
+    thread.start()
+    return thread
+
+def batch_inference_timer_callback(timer_sock):
+    """Callback for batch inference timer"""
+    try:
+        timer_sock.read(1024)  # Read the tick
+    except:
+        pass
+    process_batch_inferences()
+    # print("PROCESS BATCH INFERENCES at time: {}".format(time.time()))
+    return ReturnStatus.Continue
+
+def periodic_measure_timer_callback(timer_sock):
+    """Callback for periodic measure timer"""
+    try:
+        timer_sock.read(1024)  # Read the tick
+    except:
+        pass
+    send_periodic_measure_requests()
+    # print("SEND PERIODIC MEASURE MSG REQUESTS at time: {}".format(time.time()))
+    return ReturnStatus.Continue
+
+def timeout_check_timer_callback(timer_sock):
+    """Callback for timeout check timer"""
+    try:
+        timer_sock.read(1024)  # Read the tick
+    except:
+        pass
+    check_and_remove_timeout_flows()
+    # print("CHECK FOR AND REMOVE TIMEOUT FLOWS at time: {}".format(time.time()))
+    return ReturnStatus.Continue
+
+
+
+def build_unix_sock(unix_file):
+    if os.path.exists(unix_file):
+        log.debug("{} already exists, remove it".format(unix_file))
+        os.remove(unix_file)
+    sock = IPCSocket()
+    log.debug("UNIX IPC file: {}".format(unix_file))
+    sock.bind(unix_file)
+    sock.set_noblocking()
+    sock.listen()
+    log.info("Spine is listening for flows from env at {}".format(unix_file))
+    return sock
+
 
 def initialize_double_tree():
     """Initialize the DoubleTree model for inference"""
@@ -102,8 +195,8 @@ def initialize_double_tree():
     log.info("DoubleTree model initialized successfully")
 
 
-def get_or_create_flow_data(sock_id):
-    """Get or create per-flow data structures"""
+def ensure_flow_exists(sock_id):
+    """Ensure all per-flow data structures exist for the given sock_id"""
     global flow_states, flow_state_buffers, flow_step_counters, flow_score_states, flow_slow_starts
     
     if sock_id not in flow_states:
@@ -112,44 +205,40 @@ def get_or_create_flow_data(sock_id):
         flow_step_counters[sock_id] = 0
         flow_score_states[sock_id] = {'dt_score': INITIAL_SCORE, 'vfdt_score': INITIAL_SCORE}
         flow_slow_starts[sock_id] = True
-        log.debug("Created new flow data structures for sock_id: {}".format(sock_id))
-    
-    return (flow_states[sock_id], flow_state_buffers[sock_id], flow_step_counters[sock_id],
-            flow_score_states[sock_id], flow_slow_starts[sock_id])
+        # log.debug("Created new flow data structures for sock_id: {}".format(sock_id))
 
 
 def prepare_single_flow_for_inference(neo_state, sock_id):
     """Prepare a single flow state for inference immediately"""
     global flow_states, flow_state_buffers, flow_step_counters, batch_processing_lock, ready_for_inference
     
-    # Get or create per-flow data structures
-    flow_states, state_buffer, step_counter, score_state, slow_start = get_or_create_flow_data(sock_id)
+    # Ensure flow data structures exist
+    ensure_flow_exists(sock_id)
     
-    step_counter += 1
-    flow_step_counters[sock_id] = step_counter
+    flow_step_counters[sock_id] += 1
+    # print("neo state: {}".format(neo_state))
+    # Transform state using per-flow state (like policycache_infer.py)
+    obs, flow_states[sock_id] = transform_state(neo_state, flow_states[sock_id])
     
-    # Transform state using per-flow state
-    obs, flow_states = transform_state(neo_state, flow_states)
+    # Handle state history (like policycache_infer.py)
+    if 'state_history' not in flow_states[sock_id]:
+        flow_states[sock_id]['state_history'] = []
     
-    # Handle state history (simplified version)
-    if 'state_history' not in flow_states:
-        flow_states['state_history'] = []
-    
-    flow_states['state_history'].append(obs)
-    if len(flow_states['state_history']) > 20:
-        flow_states['state_history'].pop(0)
-    
-    # Optimized state concatenation
-    if len(flow_states['state_history']) >= STACK_LENGTH:
-        processed_obs = np.array(flow_states['state_history'][-STACK_LENGTH:]).flatten()
+    flow_states[sock_id]['state_history'].append(obs)
+    if len(flow_states[sock_id]['state_history']) > 20:
+        flow_states[sock_id]['state_history'].pop(0)
+    # print("state_history: {}".format(flow_states[sock_id]['state_history']))
+    # Optimized state concatenation (like policycache_infer.py)
+    if len(flow_states[sock_id]['state_history']) >= STACK_LENGTH:
+        processed_obs = np.array(flow_states[sock_id]['state_history'][-STACK_LENGTH:]).flatten()
     else:
         processed_obs = np.zeros(STATE_DIM * STACK_LENGTH, dtype=np.float32)
     
     # Add to ready for inference queue
     with batch_processing_lock:
-        ready_for_inference[sock_id] = (neo_state, processed_obs, step_counter, time.time())
+        ready_for_inference[sock_id] = (neo_state, processed_obs, flow_step_counters[sock_id], time.time())
     
-    log.debug("Prepared flow {} for inference, step_counter: {}".format(sock_id, step_counter))
+    # log.debug("Prepared flow {} for inference, step_counter: {}".format(sock_id, flow_step_counters[sock_id]))
 
 
 def collect_ready_inferences():
@@ -173,7 +262,7 @@ def update_flow_response_time(sock_id):
     
     with timeout_lock:
         flow_last_response_time[sock_id] = time.time()
-        log.debug("Updated response time for sock_id: {}".format(sock_id))
+        # log.debug("Updated response time for sock_id: {}".format(sock_id))
 
 
 def check_and_remove_timeout_flows():
@@ -222,7 +311,7 @@ def send_periodic_measure_requests():
     # Check if enough time has passed for sending MeasureMsg requests
     if current_time - last_measure_time < measure_interval:
         return
-    
+    # log.info("Sending periodic MeasureMsg requests at time: {}".format(current_time))
     with measure_lock:
         if not active_sock_ids:
             return
@@ -230,9 +319,9 @@ def send_periodic_measure_requests():
         # Send MeasureMsg request for each active sock_id
         for sock_id in active_sock_ids:
             try:
-                request_id_counter += 1
-                nl_send(request_id_counter, nl_sock, sock_id, msg_type=NL_MEASURE)
-                log.debug("Sent periodic MeasureMsg request for sock_id: {}, request_id: {}".format(sock_id, request_id_counter))
+                # request_id_counter += 1
+                nl_send(0, nl_sock, sock_id, msg_type=NL_MEASURE)
+                # log.debug("Sent periodic MeasureMsg request for sock_id: {}, request_id: 0".format(sock_id))
             except Exception as e:
                 log.error("Error sending periodic MeasureMsg for sock_id {}: {}".format(sock_id, e))
     
@@ -255,6 +344,8 @@ def batch_model_inference(ready_inferences):
     # Extract all observations for batch inference
     observations = np.array([data[1] for data in ready_inferences.values()])  # processed_obs is at index 1
     
+    # output observations
+    # log.debug("ready_inferences: {}".format(ready_inferences))
     # Perform batch inference
     dt_action_probs, vfdt_action_probs = double_tree.predict_prob(observations)
     
@@ -307,12 +398,12 @@ def select_action_for_flow(inference_result):
     dt_action = inference_result['dt_action']
     vfdt_action = inference_result['vfdt_action']
     
-    # Get per-flow data structures
-    flow_states, _, _, score_state, slow_start = get_or_create_flow_data(sock_id)
+    # Ensure flow data structures exist
+    ensure_flow_exists(sock_id)
     
     # Action selection logic (fast path)
-    dt_score = score_state['dt_score']
-    vfdt_score = score_state['vfdt_score']
+    dt_score = flow_score_states[sock_id]['dt_score']
+    vfdt_score = flow_score_states[sock_id]['vfdt_score']
     
     
     if not RUN_STATIC:
@@ -322,12 +413,12 @@ def select_action_for_flow(inference_result):
     if dt_score == 0 and vfdt_score == 0:
         action = Direction.PROBE
     
-    # Check last action for probe continuation
-    if 'last_action' not in flow_states:
-        flow_states['last_action'] = Direction.IDK
+    # Check last action for probe continuation (per-flow)
+    if 'last_action' not in flow_states[sock_id]:
+        flow_states[sock_id]['last_action'] = Direction.IDK
     
     last_learned_direction = get_last_learned_direction(neo_state)
-    if flow_states['last_action'] == Direction.PROBE and last_learned_direction == Direction.PROBE:
+    if flow_states[sock_id]['last_action'] == Direction.PROBE and last_learned_direction == Direction.PROBE:
         action = Direction.PROBE
     else:
         max_score = max(dt_score, vfdt_score)
@@ -338,7 +429,7 @@ def select_action_for_flow(inference_result):
     
     # Ensure action is never None
     action = action if action is not None else Direction.IDK
-    flow_states['last_action'] = action
+    flow_states[sock_id]['last_action'] = action
     
     return action
 
@@ -354,29 +445,29 @@ def update_learning_for_flow(inference_result):
     dt_recommend_action_prob = inference_result['dt_action_prob']
     vfdt_recommend_action_prob = inference_result['vfdt_action_prob']
     
-    # Get per-flow data structures
-    flow_states, state_buffer, _, score_state, slow_start = get_or_create_flow_data(sock_id)
+    # Ensure flow data structures exist
+    ensure_flow_exists(sock_id)
     
     # Update per-flow state buffer
     last_received_id = get_last_received_id(neo_state)
     last_learned_id = get_last_learned_id(neo_state)
     last_learned_direction = get_last_learned_direction(neo_state)
     
-    state_buffer[last_received_id] = {
+    flow_state_buffers[sock_id][last_received_id] = {
         'step': step_counter, 
         'state': processed_obs,
         'dt_prob': dt_recommend_action_prob,
         'vfdt_prob': vfdt_recommend_action_prob,
         'sock_id': sock_id
     }
-    if len(state_buffer) > STATE_BUFFER_SIZE:
-        state_buffer.popitem(last=False)
+    if len(flow_state_buffers[sock_id]) > STATE_BUFFER_SIZE:
+        flow_state_buffers[sock_id].popitem(last=False)
     
     # Check for learning update using per-flow buffer
     last_learned = None
-    if last_learned_id in state_buffer:
-        last_learned = state_buffer[last_learned_id]
-        state_buffer.pop(last_learned_id)
+    if last_learned_id in flow_state_buffers[sock_id]:
+        last_learned = flow_state_buffers[sock_id][last_learned_id]
+        flow_state_buffers[sock_id].pop(last_learned_id)
     
     # Update model and scores
     if step_counter > START_UPDATE_SCORE_STEP:
@@ -384,10 +475,10 @@ def update_learning_for_flow(inference_result):
             if last_learned is not None and (last_learned_direction == Direction.UP or last_learned_direction == Direction.DOWN):
                 double_tree.update_ot(last_learned['state'], last_learned_direction)
                 update_score(
-                    score_state, last_learned_direction, last_learned['dt_prob'], last_learned['vfdt_prob']
+                    flow_score_states[sock_id], last_learned_direction, last_learned['dt_prob'], last_learned['vfdt_prob']
                 )
-                if (score_state['vfdt_score'] < SLOW_START_THRESHOLD) and slow_start:
-                    slow_start = False
+                if (flow_score_states[sock_id]['vfdt_score'] < SLOW_START_THRESHOLD) and flow_slow_starts[sock_id]:
+                    flow_slow_starts[sock_id] = False
                     log.info("SLOW START is over at step: {} for flow: {}".format(step_counter, sock_id))
         except Exception as e:
             log.error("Error in updating score for flow {}: {}".format(sock_id, e))
@@ -411,7 +502,7 @@ def process_batch_inferences():
     
     last_batch_time = current_time
     
-    log.debug("Processing batch of {} inferences".format(len(ready_inferences)))
+    # log.debug("Processing batch of {} inferences at time: {}".format(len(ready_inferences), current_time))
     
     try:
         # Step 1: Perform batch model inference
@@ -442,7 +533,7 @@ def process_batch_inferences():
                 a, _ = map_action(action, neo_state, per_flow_states, slow_start=per_flow_slow_start)
                 nl_send(a, nl_sock, sock_id)
                 
-                log.debug("Action sent for sock_id: {}, action: {}".format(sock_id, a))
+                # log.debug("Action sent for sock_id: {}, action: {}".format(sock_id, a))
                 
             except Exception as e:
                 log.error("Error in action selection/sending for sock_id {}: {}".format(sock_id, e))
@@ -457,7 +548,7 @@ def process_batch_inferences():
         for inference_result in inference_results:
             try:
                 update_learning_for_flow(inference_result)
-                log.debug("Learning updated for sock_id: {}".format(inference_result['sock_id']))
+                # log.debug("Learning updated for sock_id: {}".format(inference_result['sock_id']))
             except Exception as e:
                 log.error("Error in learning update for sock_id {}: {}".format(inference_result['sock_id'], e))
     
@@ -519,7 +610,7 @@ def read_netlink_message(nl_sock: Netlink):
         # Immediately prepare flow state for inference
         prepare_single_flow_for_inference(neo_state, sock_id)
         
-        log.debug("Prepared flow {} for immediate batch inference".format(sock_id))
+        # log.debug("Prepared flow {} for immediate batch inference".format(sock_id))
         
     elif hdr.type == NL_RELEASE:        
         # flow release
@@ -576,26 +667,14 @@ def cleanup_flow_data(sock_id):
 
 def polling():
     while not cont.is_set():
-        # Process any pending batch inferences
-        process_batch_inferences()
-        
-        # Send periodic MeasureMsg requests
-        send_periodic_measure_requests()
-        
-        # Check for and remove timeout flows
-        check_and_remove_timeout_flows()
-        
         if poller.poll_once() == False:
-            # just sleep for a while (5ms to match batch processing interval)
-            
-            #print("CURRENT POLLER ACTION in polling:", poller.get_all_actions())
+            # just sleep for a while (5ms)
             time.sleep(0.005)
 
 
 def main(args):
     # Initialize the DoubleTree model
     initialize_double_tree()
-    
     # Initialize batch processing time
     global last_batch_time, last_measure_time, last_timeout_check
     last_batch_time = time.time()
@@ -610,12 +689,44 @@ def main(args):
     poller.add_action(
         Action(nl_sock, PollEvents.READ_ERR_FLAGS, callback=netlink_read_wrapper)
     )
+    
+    # Create timer pipes for different operations
+    batch_read_fd, batch_write_fd = create_timer_pipe()
+    measure_read_fd, measure_write_fd = create_timer_pipe()
+    timeout_read_fd, timeout_write_fd = create_timer_pipe()
+    
+    # Create timer socket objects for poller
+    batch_timer_sock = TimerSocket(batch_read_fd)
+    measure_timer_sock = TimerSocket(measure_read_fd)
+    timeout_timer_sock = TimerSocket(timeout_read_fd)
+    
+    # Start timer threads
+    batch_timer_thread = start_timer_thread(batch_write_fd, 0.03)   # 30ms
+    measure_timer_thread = start_timer_thread(measure_write_fd, 0.03)  # 30ms
+    timeout_timer_thread = start_timer_thread(timeout_write_fd, 1.0)   # 1 second
+    
+    # Add timer actions to poller
+    poller.add_action(
+        Action(batch_timer_sock, PollEvents.READ_ERR_FLAGS, 
+               callback=partial(batch_inference_timer_callback, batch_timer_sock))
+    )
+    poller.add_action(
+        Action(measure_timer_sock, PollEvents.READ_ERR_FLAGS, 
+               callback=partial(periodic_measure_timer_callback, measure_timer_sock))
+    )
+    poller.add_action(
+        Action(timeout_timer_sock, PollEvents.READ_ERR_FLAGS, 
+               callback=partial(timeout_check_timer_callback, timeout_timer_sock))
+    )
+    
     # print("CURRENT POLLER ACTION:", poller.get_all_actions())
     threading.Thread(target=polling).run()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    
+    default_unix_file = "/tmp/spine_ipc"
     parser.add_argument(
         "--user",
         "-u",
@@ -635,6 +746,8 @@ if __name__ == "__main__":
     drop_privileges(uid_name=args.user, gid_name=args.user)
     # after build netlink socket, we try to drop root privilege
     # assign netlink message sender
+    unix_sock = build_unix_sock(default_unix_file)
+    
     kernel_cc = args.alg
     nl_send = getattr(msg_sender, "send_{}_message".format(kernel_cc)) 
     main(args)

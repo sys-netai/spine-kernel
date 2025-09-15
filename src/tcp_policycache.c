@@ -26,7 +26,7 @@
 #define THR_UNIT_DEEPCC (1 << THR_SCALE_DEEPCC)
 
 // The number of past monitor intervals used for decision making (probing)
-#define PCC_PROBING_INTERVALS 2
+#define PCC_PROBING_INTERVALS 4
 
 #define PCC_PROBING_EPS 25
 #define PCC_PROBING_EPS_PART 1000
@@ -230,10 +230,10 @@ void generate_recommend_action(struct policycache_data *policycache, struct sock
 	}
 
 	// print the lat, cwnd, rate, utility of two intervals and the output direction
-	printk(KERN_INFO "lat_1: %llu, cwnd_1: %llu, rate_1: %llu, utility_1: %lld, lat_2: %llu, cwnd_2: %llu, rate_2: %llu, utility_2: %lld, direction: %d\n",
-		policycache->intervals[last_last_received_id].avg_rtt, policycache->intervals[last_last_received_id].cwnd, policycache->intervals[last_last_received_id].rate, policycache->intervals[last_last_received_id].utility,
-		policycache->intervals[last_received_id].avg_rtt, policycache->intervals[last_received_id].cwnd, policycache->intervals[last_received_id].rate, policycache->intervals[last_received_id].utility,
-		policycache->last_learned_direction);
+	// printk(KERN_INFO "lat_1: %llu, cwnd_1: %llu, rate_1: %llu, utility_1: %lld, lat_2: %llu, cwnd_2: %llu, rate_2: %llu, utility_2: %lld, direction: %d\n",
+	// 	policycache->intervals[last_last_received_id].avg_rtt, policycache->intervals[last_last_received_id].cwnd, policycache->intervals[last_last_received_id].rate, policycache->intervals[last_last_received_id].utility,
+	// 	policycache->intervals[last_received_id].avg_rtt, policycache->intervals[last_received_id].cwnd, policycache->intervals[last_received_id].rate, policycache->intervals[last_received_id].utility,
+	// 	policycache->last_learned_direction);
 }
 
 // update the ready_cwnd according to previous probing intervals.
@@ -469,8 +469,8 @@ void policycache_update_interval(struct policycache_interval *interval, struct p
 	interval->thr_cnt++;
 }
 
-#define VIVACE_LATENCY_COEFFICIENT 9  // scaled by 1000
-#define VIVACE_LOSS_COEFFICIENT 0     // scaled by 1000
+#define VIVACE_LATENCY_COEFFICIENT 900  // scaled by 1000
+#define VIVACE_LOSS_COEFFICIENT 11     // scaled by 1000
 #define VIVACE_SCALE 1000              // scaling factor for fixed-point math
 
 static void pcc_calc_utility_vivace_latency(struct policycache_data *policycache,

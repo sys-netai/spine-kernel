@@ -80,7 +80,8 @@ def read_netlink_message(nl_sock: Netlink):
         msg.from_raw(hdr_raw[hdr.hdr_len :])
         flow = Flow().from_create_msg(msg, hdr)
         # first find env
-        env_id = env_flows.dst_port_to_env_id.get(flow.dst_port, None)
+        dst_endpoint = (flow.dst_ip, flow.dst_port)
+        env_id = env_flows.dst_endpoint_to_env_id.get(dst_endpoint, None)
         if env_id == None:
             # log.warn("unknown dst_port: {}".format(flow.dst_port))
             return ReturnStatus.Continue
@@ -152,10 +153,11 @@ def read_unix_message(unix_sock: IPCSocket):
         return ReturnStatus.Continue
 
     if msg_type == UnixMessageType.START.value:
-        port = int(data["dst_port"])
-        # we also need to record the corresponce of env_id and dst_port
-        env_flows.bind_port_to_env(port, env_id)
-        active_flow_map.add_flow_with_dst_port(port, flow_id)
+        dst_ip = int(data["dst_ip"])
+        dst_port = int(data["dst_port"])
+        # we also need to record the corresponce of env_id and dst_endpoint
+        env_flows.bind_endpoint_to_env(dst_ip, dst_port, env_id)
+        active_flow_map.add_flow_with_dst_endpoint(dst_ip, dst_port, flow_id)
         return ReturnStatus.Continue
     elif msg_type == UnixMessageType.TERMINATE.value:
         active_flow_map.remove_all_env_flows()
@@ -163,11 +165,12 @@ def read_unix_message(unix_sock: IPCSocket):
         env_flows.release_env(env_id)
         return ReturnStatus.Cancel
     elif msg_type == UnixMessageType.END.value:
-        # we need the dsr_port id to remove the cache
+        # we need the dst_endpoint to remove the cache
         sock_id = active_flow_map.get_sockId_by_flowId(flow_id)
-        port = active_flow_map.remove_flow_by_flowId(flow_id)
+        dst_endpoint = active_flow_map.remove_flow_by_flowId(flow_id)
         # remove cached items
-        env_flows.release_port_to_env(port)
+        if dst_endpoint:
+            env_flows.release_endpoint_to_env(dst_endpoint[0], dst_endpoint[1])
         return ReturnStatus.Continue
     elif msg_type == UnixMessageType.MEASURE.value:
         # print the time, flow_id 

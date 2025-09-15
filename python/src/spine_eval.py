@@ -6,6 +6,7 @@ import json
 import time
 import argparse
 import threading
+import ipaddress
 from functools import partial
 
 
@@ -81,6 +82,11 @@ def read_netlink_message(nl_sock: Netlink):
         msg.from_raw(hdr_raw[hdr.hdr_len :])
         flow = Flow().from_create_msg(msg, hdr)
         # register new flow
+        # dst_endpoint = (flow.dst_ip, flow.dst_port)
+        # env_id = env_flows.dst_endpoint_to_env_id.get(dst_endpoint, None)
+        # if env_id == None:
+        #     log.warn("unknown dst_endpoint: {}:{}".format(ipaddress.IPv4Address(flow.dst_ip), flow.dst_port))
+        #     return ReturnStatus.Continue
         active_flow_map = env_flows.get_env_flows(env_id)
         if active_flow_map == None:
             log.warn("env: {} has not registered".format(env_id))
@@ -119,8 +125,8 @@ def read_netlink_message(nl_sock: Netlink):
     return ReturnStatus.Continue
 
 
-def make_flow_id(port):
-    return hash(port)
+def make_flow_id(dst_ip, dst_port):
+    return hash((dst_ip, dst_port))
 
 
 def read_unix_message(unix_sock: IPCSocket):
@@ -129,7 +135,8 @@ def read_unix_message(unix_sock: IPCSocket):
         return ReturnStatus.Cancel
     data = json.loads(raw)
     # env_id = str(data["env_id"])
-    port = int(data["dst_port"])
+    dst_ip = int(data["dst_ip"])
+    dst_port = int(data["dst_port"])
     msg_type = data["type"]
 
     active_flow_map = env_flows.get_env_flows(env_id)
@@ -139,14 +146,14 @@ def read_unix_message(unix_sock: IPCSocket):
     
     if msg_type == UnixMessageType.START.value:
         # print("START")
-        # we also need to record the corresponce of env_id and dst_port
-        flow_id = make_flow_id(port)
-        env_flows.bind_port_to_env(port, env_id)
-        active_flow_map.add_flow_with_dst_port(port, flow_id)
-        log.info("new flow with port: {}, assigned flow id: {}, env_id: {}".format(port, flow_id, env_id)) 
+        # we also need to record the corresponce of env_id and dst_endpoint
+        flow_id = make_flow_id(dst_ip, dst_port)
+        env_flows.bind_endpoint_to_env(dst_ip, dst_port, env_id)
+        active_flow_map.add_flow_with_dst_endpoint(dst_ip, dst_port, flow_id)
+        log.info("new flow with endpoint: {}:{}, assigned flow id: {}, env_id: {}".format(ipaddress.IPv4Address(dst_ip), dst_port, flow_id, env_id)) 
         return ReturnStatus.Continue
     
-    flow_id = active_flow_map.get_flowId_by_port(port)
+    flow_id = active_flow_map.get_flowId_by_endpoint(dst_ip, dst_port)
     assert flow_id != None
 
     if msg_type == UnixMessageType.TERMINATE.value:
