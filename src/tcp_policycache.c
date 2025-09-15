@@ -297,29 +297,25 @@ void start_interval(struct sock *sk, struct policycache_data *policycache)
 
 	// if probing, add random to the cwnd
 	if (policycache->is_probe) {
-
-		new_cwnd = policycache->ready_cwnd;
-		// Set cwnd from ready_cwnd (cwnd-first)
-		policycache->cwnd = new_cwnd;
-		policycache->ready_cwnd = new_cwnd;
-
 		if ((policycache->send_index - policycache->probe_start_index) % 2 == 0) {
+			// Set cwnd from ready_cwnd (cwnd-first)
+			policycache->cwnd = policycache->ready_cwnd;
 			get_random_bytes(&rand, 1);
 			if (rand & 1) {
-				new_cwnd = new_cwnd * (PCC_PROBING_EPS_PART + PCC_PROBING_EPS) / PCC_PROBING_EPS_PART + 1;
+				new_cwnd = policycache->cwnd * (PCC_PROBING_EPS_PART + PCC_PROBING_EPS) / PCC_PROBING_EPS_PART + 1;
 				interval->decision = PCC_CWND_UP;
 			} else {
-				new_cwnd = new_cwnd * (PCC_PROBING_EPS_PART - PCC_PROBING_EPS) / PCC_PROBING_EPS_PART - 1;
+				new_cwnd = policycache->cwnd * (PCC_PROBING_EPS_PART - PCC_PROBING_EPS) / PCC_PROBING_EPS_PART - 1;
 				interval->decision = PCC_CWND_DOWN;
 			}
 			interval->send_explore_index = 1;
 		}
 		else {// use the inverse direction of the previous interval
 			if (policycache->intervals[get_previous_index(policycache->send_index, 1u)].decision == PCC_CWND_UP) {
-				new_cwnd = new_cwnd * (PCC_PROBING_EPS_PART - PCC_PROBING_EPS) / PCC_PROBING_EPS_PART - 1;
+				new_cwnd = policycache->cwnd * (PCC_PROBING_EPS_PART - PCC_PROBING_EPS) / PCC_PROBING_EPS_PART - 1;
 				interval->decision = PCC_CWND_DOWN;
 			} else {
-				new_cwnd = new_cwnd * (PCC_PROBING_EPS_PART + PCC_PROBING_EPS) / PCC_PROBING_EPS_PART + 1;
+				new_cwnd = policycache->cwnd * (PCC_PROBING_EPS_PART + PCC_PROBING_EPS) / PCC_PROBING_EPS_PART + 1;
 				interval->decision = PCC_CWND_UP;
 			}
 			interval->send_explore_index = 2;
@@ -327,32 +323,29 @@ void start_interval(struct sock *sk, struct policycache_data *policycache)
 	}
 	else{
 		u32 last_interval_index = get_previous_index(policycache->send_index, 1u);
-		if (policycache->intervals[last_interval_index].send_explore_index == 1) {
-			new_cwnd = policycache->cwnd; // use the cwnd of the last interval
+		if (policycache->intervals[last_interval_index].send_explore_index == 3) {
 			// similar with probe, use another direction
 			if (policycache->intervals[last_interval_index].decision == PCC_CWND_UP) {
-				new_cwnd = new_cwnd * (PCC_PROBING_EPS_PART - PCC_PROBING_EPS) / PCC_PROBING_EPS_PART - 1;
+				new_cwnd = policycache->cwnd * (PCC_PROBING_EPS_PART - PCC_PROBING_EPS) / PCC_PROBING_EPS_PART - 1;
 				interval->decision = PCC_CWND_DOWN;
 			} else {
-				new_cwnd = new_cwnd * (PCC_PROBING_EPS_PART + PCC_PROBING_EPS) / PCC_PROBING_EPS_PART + 1;
+				new_cwnd = policycache->cwnd * (PCC_PROBING_EPS_PART + PCC_PROBING_EPS) / PCC_PROBING_EPS_PART + 1;
 				interval->decision = PCC_CWND_UP;
 			}
-			interval->send_explore_index = 2;
+			interval->send_explore_index = 4;
 		}
 		else{
-			new_cwnd = policycache->ready_cwnd;
-			policycache->ready_cwnd = new_cwnd;
-			policycache->cwnd = new_cwnd;
+			policycache->cwnd = policycache->ready_cwnd;
 			get_random_bytes(&rand, 1);
 			if (rand & 1) {
-				new_cwnd = new_cwnd * (PCC_PROBING_EPS_PART + PCC_PROBING_EPS) / PCC_PROBING_EPS_PART + 1;
+				new_cwnd = policycache->cwnd * (PCC_PROBING_EPS_PART + PCC_PROBING_EPS) / PCC_PROBING_EPS_PART + 1;
 				interval->decision = PCC_CWND_UP;
 			} else {
-				new_cwnd = new_cwnd * (PCC_PROBING_EPS_PART - PCC_PROBING_EPS) / PCC_PROBING_EPS_PART - 1;
+				new_cwnd = policycache->cwnd * (PCC_PROBING_EPS_PART - PCC_PROBING_EPS) / PCC_PROBING_EPS_PART - 1;
 				interval->decision = PCC_CWND_DOWN;
 			}
 
-			interval->send_explore_index = 1;
+			interval->send_explore_index = 3;
 		}
 	}
 	new_cwnd = max(4ULL, new_cwnd);
@@ -618,7 +611,7 @@ void policycache_process(struct sock *sk, const struct rate_sample *rs)
 		}
 
 		// seperate cwnd update with training sample generation
-		if (policycache->intervals[(u32)policycache->receive_index].send_explore_index == 2){
+		if (policycache->intervals[(u32)policycache->receive_index].send_explore_index == 2 || policycache->intervals[(u32)policycache->receive_index].send_explore_index == 4){
 			generate_recommend_action(policycache, sk);
 		}
 

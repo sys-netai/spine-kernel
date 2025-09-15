@@ -34,12 +34,16 @@ class DoubleTree:
     def __init__(self,
                  dt_path: str = 'decision_tree_online.pkl',
                  n_classes: list = [0, 1],
-                 online_tree_type: TreeType = TreeType.VFDT
+                 online_tree_type: TreeType = TreeType.VFDT,
+                 using_dt: bool = False
                  ):
-        # 1. 加载离线决策树
-        # dt_path not existed
+        # 1. 加载离线决策树 (only if using_dt=True)
+        self.using_dt = using_dt
         self.dt_path = dt_path
-        if (dt_path is None or dt_path == '') or not os.path.exists(dt_path):
+        if not using_dt:
+            # Skip decision tree initialization for cost savings
+            self.dt = None
+        elif (dt_path is None or dt_path == '') or not os.path.exists(dt_path):
             # create a new dt 
             self.dt = None
         else:
@@ -56,9 +60,10 @@ class DoubleTree:
         
 
     def save(self, dt_path, vfdt_path):
-        with open(dt_path, 'wb') as f:
-            # dump the dt and vfdt
-            pickle.dump(self.dt, f)
+        if self.using_dt:
+            with open(dt_path, 'wb') as f:
+                # dump the dt and vfdt
+                pickle.dump(self.dt, f)
         with open(vfdt_path, 'wb') as f:
             # Save both the online tree and learned_samples count
             save_data = {
@@ -68,9 +73,10 @@ class DoubleTree:
             pickle.dump(save_data, f)
 
     def load(self, dt_path, vfdt_path):
-        with open(dt_path, 'rb') as f:
-            # load the dt and vfdt
-            self.dt = pickle.load(f)
+        if self.using_dt:
+            with open(dt_path, 'rb') as f:
+                # load the dt and vfdt
+                self.dt = pickle.load(f)
         with open(vfdt_path, 'rb') as f:
             # Load both the online tree and learned_samples count
             load_data = pickle.load(f)
@@ -90,7 +96,7 @@ class DoubleTree:
         """
         # 确保是 numpy 二维数组，shape=(1, n_features)
         x = np.array(state, dtype=np.float32).reshape(1, -1)
-        if self.dt is None:
+        if not self.using_dt or self.dt is None:
             a_dt = None
         else:
             a_dt = self.dt.predict(x)
@@ -105,7 +111,7 @@ class DoubleTree:
         """
         # 确保是 numpy 二维数组，shape=(1, n_features)
         x = np.array(state, dtype=np.float32).reshape(1, -1)
-        if self.dt is None:
+        if not self.using_dt or self.dt is None:
             a_dt = None
         else:
             a_dt = self.dt.predict_proba(x)
@@ -227,6 +233,8 @@ class DoubleTree:
         return self.online_tree.measure_tree_depth(), self.online_tree.measure_byte_size(), self.online_tree.get_model_description()
     
     def reload_distill_tree(self, dt_path):
+        if not self.using_dt:
+            return
         with open(dt_path, 'rb') as f:
             self.dt = pickle.load(f)
             
@@ -239,7 +247,8 @@ class DoubleTree:
         new_double_tree = DoubleTree(
             dt_path=self.dt_path,
             n_classes=self.n_classes,
-            online_tree_type=self.online_tree_type
+            online_tree_type=self.online_tree_type,
+            using_dt=self.using_dt
         )
         return new_double_tree      
     
@@ -270,7 +279,7 @@ class DoubleTree:
             grace_period=50,           # 每个节点见到多少样本后才考虑分裂
             split_confidence=1e-7,     # 分裂置信度，越小越容易分裂
             tie_threshold=0.1,        # 特征分裂的平局阈值
-            leaf_prediction='nba',     # 叶子预测方式：'nba' = Naive Bayes Adaptive
+            leaf_prediction='mc',     # 叶子预测方式：'nba' = Naive Bayes Adaptive
             nb_threshold=50,           # 叶节点样本数≥此值才启用 NB，<则多数类
             binary_split=True          # 二分裂（True）或多分裂（False）
             )   

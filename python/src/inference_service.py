@@ -53,6 +53,10 @@ double_tree = DoubleTree(
     n_classes=[0, 1],
 )
 
+# train 3 dumb samples 
+for i in range(3):
+    double_tree.update_ot([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 1)
+
 IPC_PATH = "/tmp/inference_service_ipc"
 if os.path.exists(IPC_PATH):
     os.remove(IPC_PATH)
@@ -110,13 +114,13 @@ def handle_client_message(client: IPCSocket):
 
             # sanity checks
             if dt_action_prob is None:
-                dt_action_prob = np.array([[0.5, 0.5]])
+                dt_action_prob = np.array([[0,1]])
             if vfdt_action_prob is None:
-                vfdt_action_prob = np.array([[0.5, 0.5]])
+                vfdt_action_prob = np.array([[0,1]])
             if len(vfdt_action_prob[0]) < 2 or sum(vfdt_action_prob[0]) < 0.99:
-                vfdt_action_prob = np.array([[0.5, 0.5]])
+                vfdt_action_prob = np.array([[0,1]])
             if len(dt_action_prob[0]) < 2 or sum(dt_action_prob[0]) < 0.99:
-                dt_action_prob = np.array([[0.5, 0.5]])
+                dt_action_prob = np.array([[0,1]])
 
             reply = {
                 "dt_action_prob": dt_action_prob[0].tolist(),
@@ -129,6 +133,7 @@ def handle_client_message(client: IPCSocket):
             action = data["action"]
             rwlock.acquire_write()
             try:
+                # (f"Updating tree with state: {state} and action: {action}")
                 double_tree.update_ot(state, action)
             finally:
                 rwlock.release_write()
