@@ -57,8 +57,10 @@ struct policycache_interval {
 	u64 send_start; /* timestamps for when interval data was being sent */
 	u64 send_end;
 
-	u64 start_rtt; /* smoothed RTT at start and end of this interval */
-	u64 end_rtt;
+	/* average RTT within this interval */
+	u64 rtt_sum;
+	u32 rtt_cnt;
+	u64 avg_rtt;
 
 	u32 recv_id_when_sent;
 
@@ -275,6 +277,23 @@ bool policycache_valid(struct policycache_data *policycache)
 	return (policycache && policycache->intervals && policycache->intervals[0].rate);
 }
 
+/* Update pacing rate based on current cwnd and srtt, mirroring tcp_neo.c */
+static void policycache_update_pacing_rate(struct sock *sk)
+{
+    const struct tcp_sock *tp = tcp_sk(sk);
+    u64 rate;
+
+    cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
+
+    rate = tcp_mss_to_mtu(sk, tcp_sk(sk)->mss_cache);
+    rate *= USEC_PER_SEC;
+    rate *= max(tp->snd_cwnd, tp->packets_out);
+    if (likely(tp->srtt_us >> 3))
+        do_div(rate, tp->srtt_us >> 3);
+
+    WRITE_ONCE(sk->sk_pacing_rate, min_t(u64, rate, sk->sk_max_pacing_rate));
+}
+
 /* Set the pacing rate and cwnd base on the currently-sending interval */
 void start_interval(struct sock *sk, struct policycache_data *policycache)
 {
@@ -420,8 +439,17 @@ void start_next_send_interval(struct sock *sk, struct policycache_data *policyca
 void policycache_update_interval(struct policycache_interval *interval, struct policycache_data *policycache,
 			 struct sock *sk, const struct rate_sample *rs)
 {
-	interval->recv_end = tcp_sk(sk)->tcp_mstamp;
-	interval->end_rtt = tcp_sk(sk)->srtt_us >> 3;
+    interval->recv_end = tcp_sk(sk)->tcp_mstamp;
+    /* accumulate RTT samples for average RTT */
+    if (rs && rs->rtt_us > 0) {
+        interval->rtt_sum += (u64)rs->rtt_us;
+        interval->rtt_cnt++;
+    } else if (tcp_sk(sk)->srtt_us) {
+        interval->rtt_sum += (u64)(tcp_sk(sk)->srtt_us >> 3);
+        interval->rtt_cnt++;
+    }
+    if (interval->rtt_cnt > 0)
+        interval->avg_rtt = interval->rtt_sum / interval->rtt_cnt;
 	interval->lost += tcp_sk(sk)->lost - policycache->lost_base;
 	interval->delivered += tcp_sk(sk)->delivered - policycache->delivered_base;
 	
@@ -462,7 +490,12 @@ static void pcc_calc_utility_vivace_latency(struct policycache_data *policycache
 		return;
 	}
 
-	rtt_diff = interval->end_rtt - interval->start_rtt;
+    /* compare average RTT of current received interval with the last received interval */
+    {
+        u32 last_received_index = get_previous_index(policycache->receive_index, 1u);
+        struct policycache_interval *prev_interval = &policycache->intervals[last_received_index];
+        rtt_diff = (s64)interval->avg_rtt - (s64)prev_interval->avg_rtt;
+    }
     if (throughput > 0)
 	    rtt_diff_thresh = (2 * USEC_PER_SEC * mss) / throughput;
 	if (send_dur > 0)
@@ -497,10 +530,10 @@ static void pcc_calc_utility_vivace_latency(struct policycache_data *policycache
 	// }
 	
 	// throughput - 900 * lat_infl - 11 * loss_ratio;
-	// printk(KERN_INFO
-	// 	"%d ucalc: rate %lld sent %u delv %lld lost %lld lat (%lld->%lld) util %lld rate %lld thpt %lld\n",
-	// 	 policycache->id, rate, interval->packets_ended - interval->packets_sent_base,
-	// 	 delivered, lost, interval->start_rtt / USEC_PER_MSEC, interval->end_rtt / USEC_PER_MSEC, util, rate, throughput);
+    // printk(KERN_INFO
+    // 	"%d ucalc: rate %lld sent %u delv %lld lost %lld avg_rtt %lld prev_avg_rtt %lld util %lld rate %lld thpt %lld\n",
+    // 	 policycache->id, rate, interval->packets_ended - interval->packets_sent_base,
+    // 	 delivered, lost, interval->avg_rtt / USEC_PER_MSEC, prev_interval->avg_rtt / USEC_PER_MSEC, util, rate, throughput);
 	interval->utility = util;
 }
 
@@ -617,9 +650,12 @@ void policycache_process(struct sock *sk, const struct rate_sample *rs)
 
 		// update the receive index
 		policycache->receive_index = get_next_index(index);
-		interval = &policycache->intervals[policycache->receive_index];
-		interval->recv_start = tcp_sk(sk)->tcp_mstamp;
-		interval->start_rtt = tcp_sk(sk)->srtt_us >> 3;
+    interval = &policycache->intervals[policycache->receive_index];
+        interval->recv_start = tcp_sk(sk)->tcp_mstamp;
+        /* reset RTT accumulators for the new interval */
+        interval->rtt_sum = 0;
+        interval->rtt_cnt = 0;
+        interval->avg_rtt = 0;
 		if (policycache->receive_index == 0)
 			policycache->first_circle = false;
 	}
@@ -692,8 +728,8 @@ void policycache_fetch_measurements(struct spine_connection *conn,
 	measurements[3] = policycache->intervals[last_last_received_id].lost;
 	measurements[4] = policycache->intervals[last_received_id].packets_ended - policycache->intervals[last_received_id].packets_sent_base;
 	measurements[5] = policycache->intervals[last_last_received_id].packets_ended -  policycache->intervals[last_last_received_id].packets_sent_base; 
-	measurements[6] = policycache->intervals[last_received_id].end_rtt;
-	measurements[7]	= policycache->intervals[last_received_id].start_rtt;
+    measurements[6] = policycache->intervals[last_received_id].avg_rtt;
+    measurements[7]	= policycache->intervals[last_last_received_id].avg_rtt;
 	// // output rece and send start and end times
 	// pr_info ("The last interval: send_start: %llu, send_end: %llu, recv_start: %llu, recv_end: %llu", policycache->intervals[last_received_id].send_start, policycache->intervals[last_received_id].send_end, policycache->intervals[last_received_id].recv_start, policycache->intervals[last_received_id].recv_end);
 	// // output their differences
@@ -796,7 +832,7 @@ static inline void policycache_reset(struct policycache_data *ca)
 	ca->in_recovery = false;
 	ca->prior_cwnd = 0;
 	ca->r_cwnd = 0;
-	ca->slow_start_passed = 0;
+	ca->slow_start_passed = 1;
 }
 
 static void policycache_init(struct sock *sk)
@@ -817,8 +853,8 @@ static void policycache_init(struct sock *sk)
 	tp->snd_cwnd = 64;//64; // init value
 	ca->cwnd = tp->snd_cwnd;
 	ca->ready_cwnd = tp->snd_cwnd;
-	ca->is_probe = true;
-
+	ca->is_probe = false;
+	ca->slow_start_passed = 1;
 	ca->send_index = 0;
 	ca->receive_index = 0;
 	ca->probe_start_index = 0;
@@ -866,12 +902,20 @@ static void policycache_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 static u32 policycache_ssthresh(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
-	// we want RL to take more efficient control
 	struct policycache_data *ca = inet_csk_ca(sk);
+	struct policycache_interval *interval = &ca->intervals[ca->send_index];
+	// we want RL to take more efficient control
 	u64 cwnd;
-	struct policycache_interval *interval;
 	if (!ca->slow_start_passed){
 	 	ca->slow_start_passed = 1;
+		tp->snd_cwnd = tp->snd_cwnd * 500 / 1000;
+		policycache_update_pacing_rate(sk);
+		interval = &ca->intervals[ca->send_index];
+		interval->cwnd = tp->snd_cwnd;
+		interval->rate = sk->sk_pacing_rate;
+		ca->ready_cwnd = tp->snd_cwnd;
+		ca->cwnd = tp->snd_cwnd;
+		pr_info("The ssthresh called, cwnd: %d\n", tp->snd_cwnd);
 	}
 	// pr_info("The ssthresh called, cwnd: %d\n", tp->snd_cwnd);
 	// ca->ready_cwnd = ca->cwnd * 717 / 1000;
@@ -944,20 +988,24 @@ static void slow_set_cwnd(struct sock *sk, u32 acked)
 
 }
 
-// u32 policycache_slow_start(struct sock *sk, u32 acked)
-// {
-// 	struct tcp_sock *tp = tcp_sk(sk);
-// 	struct policycache_data *ca = inet_csk_ca(sk);
-// 	u64 rate;
-// 	ca->cnt += acked * 500;
-// 	slow_set_cwnd(sk, acked);
-// 	policycache_update_pacing_rate(sk);
+/* Slow start behavior similar to tcp_neo.c */
+static void policycache_slow_start(struct sock *sk, u32 acked)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct policycache_data *ca = inet_csk_ca(sk);
+    struct policycache_interval *interval = &ca->intervals[ca->send_index];
+    u64 rate;
 
-// 	rate = sk->sk_pacing_rate;
-// 	ca->intervals[0].rate = rate;
-// 	ca->ready_rate = rate;
-// 	ca->rate = rate;
-// }
+    ca->cnt += acked * 100;
+    slow_set_cwnd(sk, acked);
+    policycache_update_pacing_rate(sk);
+
+    rate = sk->sk_pacing_rate;
+    interval->rate = rate;
+    interval->cwnd = tp->snd_cwnd;
+    ca->ready_cwnd = tp->snd_cwnd;
+    ca->cwnd = tp->snd_cwnd;
+}
 
 
 
@@ -970,12 +1018,11 @@ static void policycache_cong_control(struct sock *sk, const struct rate_sample *
 	u32 acked = rs->acked_sacked; //rs->delivered;
 	int ok = 0;
 	// printk(KERN_INFO "[POLICYCACHE] Get into control1.\n");
-	// we only do slow start when flow starts
-	// if (tcp_in_slow_start(tp) && !ca->slow_start_passed) {
-	// 	// printk(KERN_INFO "[POLICYCACHE] acked: %d, delivered %d.\n, ",  rs->acked_sacked, rs->delivered);
-	// 	policycache_slow_start(sk, acked);
-	// 	goto end;
-	// }
+    // we only do slow start when flow starts
+    if (tcp_in_slow_start(tp) && !ca->slow_start_passed) {
+        policycache_slow_start(sk, acked);
+        goto end;
+    }
 
 	// if (prev_state >= TCP_CA_Recovery && state < TCP_CA_Recovery) {
 	// 	/* Exiting loss recovery; restore cwnd saved before recovery. */
