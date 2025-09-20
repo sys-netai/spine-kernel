@@ -228,6 +228,12 @@ void generate_recommend_action(struct policycache_data *policycache, struct sock
 	else{
 		policycache->last_learned_direction = 2;
 	}
+
+	// print the lat, cwnd, rate, utility of two intervals and the output direction
+	printk(KERN_INFO "lat_1: %llu, cwnd_1: %llu, rate_1: %llu, utility_1: %lld, lat_2: %llu, cwnd_2: %llu, rate_2: %llu, utility_2: %lld, direction: %d\n",
+		policycache->intervals[last_last_received_id].avg_rtt, policycache->intervals[last_last_received_id].cwnd, policycache->intervals[last_last_received_id].rate, policycache->intervals[last_last_received_id].utility,
+		policycache->intervals[last_received_id].avg_rtt, policycache->intervals[last_received_id].cwnd, policycache->intervals[last_received_id].rate, policycache->intervals[last_received_id].utility,
+		policycache->last_learned_direction);
 }
 
 // update the ready_cwnd according to previous probing intervals.
@@ -463,8 +469,8 @@ void policycache_update_interval(struct policycache_interval *interval, struct p
 	interval->thr_cnt++;
 }
 
-#define VIVACE_LATENCY_COEFFICIENT 900  // scaled by 1000
-#define VIVACE_LOSS_COEFFICIENT 11     // scaled by 1000
+#define VIVACE_LATENCY_COEFFICIENT 9  // scaled by 1000
+#define VIVACE_LOSS_COEFFICIENT 0     // scaled by 1000
 #define VIVACE_SCALE 1000              // scaling factor for fixed-point math
 
 static void pcc_calc_utility_vivace_latency(struct policycache_data *policycache,
@@ -519,7 +525,7 @@ static void pcc_calc_utility_vivace_latency(struct policycache_data *policycache
 	/* loss rate = lost packets / all packets counted*/
 	loss_ratio = (lost * POLICYCACHE_SCALE) / (lost + delivered);
 
-	util = /* int_sqrt((u64)rate)*/ rate - (rate * (VIVACE_LATENCY_COEFFICIENT * lat_infl + VIVACE_LOSS_COEFFICIENT * loss_ratio)) / POLICYCACHE_SCALE;
+	util = /* int_sqrt((u64)rate)*/ rate- (rate * (VIVACE_LATENCY_COEFFICIENT * lat_infl + VIVACE_LOSS_COEFFICIENT * loss_ratio)) / POLICYCACHE_SCALE;
 	// used to test whether a concave utility is necessary.
 	// if (lat_infl == 0){
 	// 	util = rate;
