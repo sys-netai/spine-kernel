@@ -4,9 +4,10 @@ import threading
 import time
 import numpy as np
 from functools import partial
+import context 
 
 from ipc_socket import IPCSocket
-from policycache import DoubleTree, TreeType
+from agent.policycache import DoubleTree, TreeType
 from poller import Action, Poller, ReturnStatus, PollEvents
 
 
