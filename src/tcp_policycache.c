@@ -897,7 +897,7 @@ static void policycache_set_state(struct sock *sk, u8 new_state)
 	if (!policycache_valid(policycache))
 		return;
 
-	if (policycache->prev_ca_state = TCP_CA_Loss && new_state != TCP_CA_Loss) {
+	if (policycache->prev_ca_state == TCP_CA_Loss && new_state != TCP_CA_Loss) {
 		double_counted = tcp_sk(sk)->delivered + tcp_sk(sk)->lost+
 			tcp_packets_in_flight(tcp_sk(sk));
 		double_counted -= tcp_sk(sk)->data_segs_out;

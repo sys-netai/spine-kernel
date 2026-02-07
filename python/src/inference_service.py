@@ -7,7 +7,7 @@ from functools import partial
 import context 
 
 from ipc_socket import IPCSocket
-from agent.policycache import DoubleTree, TreeType
+from policycache import DoubleTree, TreeType
 from poller import Action, Poller, ReturnStatus, PollEvents
 
 
