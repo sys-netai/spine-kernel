@@ -80,7 +80,7 @@ int serialize_header(char *buf, int bufsize, struct SpineMsgHeader *hdr);
 #define MAX_LOCAL_REG 8
 #define MAX_MUTABLE_REG 222 // # report + # control + cwnd, rate registers
 #define MAX_MEASUREMENG_REG 1
-#define MAX_MEASUREMENT_FIELDS 16
+#define MAX_MEASUREMENT_FIELDS 64
 
 struct __attribute__((packed, aligned(4))) StateMsg {
 	u32 number;

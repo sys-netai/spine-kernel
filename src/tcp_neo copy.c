@@ -6,7 +6,6 @@
 #include <net/tcp.h>
 
 #include "lib/spine.h"
-#include "lib/spine_priv.h"
 #include "spine_nl.h"
 #include "tcp_spine.h"
 
@@ -115,14 +114,14 @@ struct neo_data {
  * Util functions *
  *****************/
 
-static inline u32 get_next_index(u32 index)
+static u32 get_next_index(u32 index)
 {
 	if (index < NEO_INTERVALS - 1)
 		return index + 1;
 	return 0;
 }
 
-static inline u32 get_previous_index(u32 index, u32 step)
+static u32 get_previous_index(u32 index, u32 step)
 {
 	if (index > step - 1)
 		return index - step;
@@ -130,32 +129,9 @@ static inline u32 get_previous_index(u32 index, u32 step)
 		return NEO_INTERVALS - (step - index);
 }
 
-static inline void neo_reset_interval(struct neo_interval *interval)
+static void neo_reset_interval(struct neo_interval *interval)
 {
 	memset(interval, 0, sizeof(*interval));
-}
-
-static inline bool neo_spine_work_pending(struct spine_connection *conn)
-{
-	struct spine_priv_state *state;
-	int i;
-
-	if (!conn)
-		return false;
-
-	state = get_spine_priv_state(conn);
-	if (!state)
-		return false;
-
-	if (!state->sent_create || state->pending_update.measure_is_pending)
-		return true;
-
-	for (i = 0; i < MAX_CONTROL_REG; i++) {
-		if (state->pending_update.control_is_pending[i])
-			return true;
-	}
-
-	return false;
 }
 
 /*********************
@@ -252,12 +228,6 @@ static void start_interval(struct sock *sk, struct neo_data *neo)
  * intervals & sampling
  **************************/
 
-enum neo_receive_end_reason {
-	NEO_RECV_END_NONE = 0,
-	NEO_RECV_END_PACKET_COUNT,
-	NEO_RECV_END_RTT_TIMEOUT,
-};
-
 /* Have we sent all the data we need for this interval? */
 static bool send_interval_ended(struct neo_interval *interval,
 				struct tcp_sock *tsk,
@@ -288,17 +258,8 @@ static bool send_interval_ended(struct neo_interval *interval,
  */
 static bool receive_interval_ended(struct neo_interval *interval,
 				   struct tcp_sock *tsk,
-				   struct neo_data *neo,
-				   enum neo_receive_end_reason *reason,
-				   u32 *rtt_us_used)
+				   struct neo_data *neo)
 {
-	u32 rtt;
-
-	if (reason)
-		*reason = NEO_RECV_END_NONE;
-	if (rtt_us_used)
-		*rtt_us_used = 0;
-
 	if (interval->send_end == 0)
 		return false;
 
@@ -306,22 +267,16 @@ static bool receive_interval_ended(struct neo_interval *interval,
 		return false;
 
 	if ((s32)(neo->packets_counted + NEO_IGNORE_PACKETS - interval->packets_ended) >= 0) {
-		if (reason)
-			*reason = NEO_RECV_END_PACKET_COUNT;
 		return true;
 	}
 
-	rtt = tsk->rack.rtt_us ? tsk->rack.rtt_us : (tsk->srtt_us >> 3);
+	u32 rtt = tsk->rack.rtt_us ? tsk->rack.rtt_us : (tsk->srtt_us >> 3);
 	rtt = max(rtt, 1000U); // 至少给 1ms 宽限
-	if (rtt_us_used)
-		*rtt_us_used = rtt;
-	if (tsk->tcp_mstamp > interval->send_end + rtt) {
-		if (reason)
-			*reason = NEO_RECV_END_RTT_TIMEOUT;
-		return true;
-	}
+    if (tsk->tcp_mstamp > interval->send_end + rtt) {
+       return true;
+    }
 
-	return false;
+    return false;
 }
 
 /* Start the next interval's sending stage. */
@@ -378,12 +333,12 @@ static void neo_process(struct sock *sk, const struct rate_sample *rs)
 	struct neo_data *neo = inet_csk_ca(sk);
 	struct tcp_sock *tsk = tcp_sk(sk);
 	struct neo_interval *interval;
-	enum neo_receive_end_reason end_reason = NEO_RECV_END_NONE;
-	u32 end_rtt_us = 0;
 	u32 index;
 
 	if (!neo_valid(neo))
 		return;
+
+	neo_update_pacing_rate(sk);
 
 	/* update send interval */
 	interval = &neo->intervals[neo->send_index];
@@ -391,8 +346,6 @@ static void neo_process(struct sock *sk, const struct rate_sample *rs)
 		if (interval->send_end == 0)
 			interval->send_end = tsk->tcp_mstamp;
 		start_next_send_interval(sk, neo);
-	} else {
-		neo_update_pacing_rate(sk);
 	}
 
 	/* update receive interval */
@@ -404,17 +357,7 @@ static void neo_process(struct sock *sk, const struct rate_sample *rs)
 	/* Important: update first, then test end. */
 	neo_update_interval(interval, neo, sk, rs);
 
-	if (receive_interval_ended(interval, tsk, neo, &end_reason, &end_rtt_us)) {
-		pr_info_ratelimited(
-			"receive interval complete id=%u reason=%s packets_counted=%u packets_ended=%u send_end=%llu now=%llu rtt_us=%u\n",
-			interval->receive_id,
-			end_reason == NEO_RECV_END_PACKET_COUNT ? "packet_count" :
-			(end_reason == NEO_RECV_END_RTT_TIMEOUT ? "rtt_timeout" : "unknown"),
-			neo->packets_counted,
-			interval->packets_ended,
-			interval->send_end,
-			tsk->tcp_mstamp,
-			end_rtt_us);
+	if (receive_interval_ended(interval, tsk, neo)) {
 		neo->receive_index = get_next_index(index);
 
 		if (neo->receive_index == 0)
@@ -442,19 +385,17 @@ static void neo_fetch_measurements(struct spine_connection *conn,
 	u32 last_last_received_idx;
 	struct neo_interval *send_interval;
 	u64 avg_thr;
-	u32 prev_received_idx;
-	u64 prev_avg_thr;
 
 	get_sock_from_spine(&sk, conn);
 	tp = tcp_sk(sk);
 	neo = inet_csk_ca(sk);
 
-	*num_fields = 38;
+	*num_fields = 18;
 
 	send_interval = &neo->intervals[neo->send_index];
 
 	if (neo->first_circle && neo->receive_index < 2) {
-		memset(measurements, 0, 38 * sizeof(*measurements));
+		memset(measurements, 0, 18 * sizeof(*measurements));
 		measurements[16] = send_interval->send_id;
 
 		if (neo->receive_index == 0)
@@ -462,7 +403,6 @@ static void neo_fetch_measurements(struct spine_connection *conn,
 		else
 			measurements[17] =
 				neo->intervals[get_previous_index(neo->receive_index, 1u)].receive_id;
-		measurements[18] = 0; /* no previous completed receive interval yet */
 		return;
 	}
 
@@ -508,62 +448,6 @@ static void neo_fetch_measurements(struct spine_connection *conn,
 	measurements[16] = send_interval->send_id;
 	/* latest completed receive interval id (same namespace as send_id) */
 	measurements[17] = neo->intervals[last_received_idx].receive_id;
-	/* previous completed receive interval id */
-	measurements[18] = neo->intervals[last_last_received_idx].receive_id;
-
-	/*
-	 * Auxiliary historical block:
-	 * measurements[19..37] is a self-contained "previous completed" snapshot.
-	 *
-	 * It allows userspace to backfill the commonly observed k -> k+2 case:
-	 *   primary block latest    = k+2
-	 *   auxiliary block latest  = k+1
-	 *
-	 * When there is not enough history yet, leave the auxiliary block zeroed.
-	 */
-	memset(&measurements[19], 0, 19 * sizeof(*measurements));
-	if (!neo->first_circle || neo->receive_index >= 3) {
-		prev_received_idx = get_previous_index(last_last_received_idx, 1u);
-
-		measurements[19 + 0] = neo->intervals[last_last_received_idx].delivered;
-		measurements[19 + 1] = neo->intervals[prev_received_idx].delivered;
-		measurements[19 + 2] = neo->intervals[last_last_received_idx].lost;
-		measurements[19 + 3] = neo->intervals[prev_received_idx].lost;
-		measurements[19 + 4] = neo->intervals[last_last_received_idx].packets_ended -
-				       neo->intervals[last_last_received_idx].packets_sent_base;
-		measurements[19 + 5] = neo->intervals[prev_received_idx].packets_ended -
-				       neo->intervals[prev_received_idx].packets_sent_base;
-		measurements[19 + 6] = neo->intervals[last_last_received_idx].end_rtt;
-		measurements[19 + 7] = neo->intervals[last_last_received_idx].start_rtt;
-		measurements[19 + 8] = neo->intervals[last_last_received_idx].recv_end -
-				       neo->intervals[last_last_received_idx].recv_start;
-		measurements[19 + 9] = neo->intervals[prev_received_idx].recv_end -
-				       neo->intervals[prev_received_idx].recv_start;
-		measurements[19 + 10] = neo->intervals[last_last_received_idx].send_end -
-					neo->intervals[last_last_received_idx].send_start;
-		measurements[19 + 11] = neo->intervals[prev_received_idx].send_end -
-					neo->intervals[prev_received_idx].send_start;
-		measurements[19 + 12] = neo->intervals[last_last_received_idx].cwnd;
-		measurements[19 + 13] = neo->intervals[prev_received_idx].cwnd;
-		measurements[19 + 14] = neo->intervals[last_last_received_idx].cwnd;
-
-		if (neo->intervals[last_last_received_idx].thr_cnt > 0) {
-			prev_avg_thr = neo->intervals[last_last_received_idx].avg_throughput /
-				       neo->intervals[last_last_received_idx].thr_cnt;
-
-			if (prev_avg_thr <= U64_MAX / (tp->mss_cache * USEC_PER_SEC / THR_UNIT_DEEPCC))
-				measurements[19 + 15] =
-					prev_avg_thr * tp->mss_cache * USEC_PER_SEC / THR_UNIT_DEEPCC;
-			else
-				measurements[19 + 15] = U64_MAX;
-		} else {
-			measurements[19 + 15] = 0;
-		}
-
-		measurements[19 + 16] = 0;
-		measurements[19 + 17] = neo->intervals[last_last_received_idx].receive_id;
-		measurements[19 + 18] = neo->intervals[prev_received_idx].receive_id;
-	}
 }
 
 /**
@@ -752,7 +636,7 @@ static void neo_cong_control(struct sock *sk, const struct rate_sample *rs)
 
 	neo_process(sk, rs);
 
-	if (neo_spine_work_pending(conn)) {
+	if (conn != NULL) {
 		ok = spine_invoke(conn);
 		if (ok < 0)
 			pr_info("fail to call spine_invoke: %d\n", ok);
